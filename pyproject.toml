@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "campaignforge"
+version = "1.0.0"
+description = "Context-aware hierarchical procedural world and battle-map generator for tabletop campaigns"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {file = "LICENSE"}
+dependencies = ["Pillow>=10.0"]
+keywords = ["dnd", "tabletop", "map-generator", "procedural-generation", "campaign"]
+
+[project.scripts]
+campaignforge = "campaignforge.app:main"
+
+[tool.setuptools.packages.find]
+include = ["campaignforge*"]
