@@ -19,6 +19,9 @@ MAJOR_LOCATION_SUBTYPES = {
     "ruin",
     "dungeon_entrance",
     "mine",
+    "dragon_lair",
+    "bandit_camp",
+    "ruined_city",
 }
 
 
@@ -75,11 +78,20 @@ def resolve_selection(scene: Scene, rect: tuple[int, int, int, int]) -> Selectio
     fraction = _selection_fraction(scene, rect)
     lod = _lod_for(scene, fraction, len(majors))
 
-    if scene.kind == "building" and rooms:
+    floors = [e for e in entities if e.kind == "floor"]
+    if scene.kind == "building_section" and floors:
+        if len(floors) == 1:
+            focus = floors[0]
+            return SelectionContext("floor", biome, focus, [focus], lod=3, selection_fraction=fraction, reason="floor inside multi-floor building")
+        focus = min(floors, key=lambda e: math.hypot(e.x - cx, e.y - cy))
+        return SelectionContext("floor", biome, focus, [focus], lod=3, selection_fraction=fraction, reason="floor inside multi-floor building")
+    if scene.kind in {"building", "floor"} and rooms:
         focus = min(rooms, key=lambda e: math.hypot(e.x - cx, e.y - cy))
         return SelectionContext("room", biome, focus, [focus], lod=3, selection_fraction=fraction, reason="room inside building")
     if scene.kind == "room":
         return SelectionContext("room", biome, lod=3, selection_fraction=fraction, reason="already inside a room")
+    if scene.kind in {"cavern", "dragon_lair"}:
+        return SelectionContext("terminal", biome, lod=3, selection_fraction=fraction, reason="terminal detailed location")
     if scene.kind in {"town", "castle", "mage_tower"} and buildings:
         if len(buildings) == 1:
             focus = buildings[0]
@@ -150,6 +162,8 @@ def resolve_selection(scene: Scene, rect: tuple[int, int, int, int]) -> Selectio
 def context_for_entity(scene: Scene, entity: Entity) -> SelectionContext:
     biome = entity.metadata.get("biome") or scene.sample_biome(entity.x, entity.y)
     entrances = road_entrances_for_entity(scene, entity)
+    if entity.kind == "floor":
+        return SelectionContext("floor", biome, entity, [entity], lod=3, reason="building floor")
     if entity.kind == "settlement":
         if entity.subtype == "castle":
             return SelectionContext("castle", biome, entity, [entity], road_entrances=entrances, lod=3, reason="castle settlement")
@@ -158,11 +172,23 @@ def context_for_entity(scene: Scene, entity: Entity) -> SelectionContext:
         return SelectionContext("building", biome, entity, [entity], road_entrances=entrances, lod=3, reason="building")
     if entity.kind == "room":
         return SelectionContext("room", biome, entity, [entity], lod=3, reason="room")
-    if entity.subtype in {"castle", "fort"}:
-        return SelectionContext("castle", biome, entity, [entity], road_entrances=entrances, lod=3, reason="castle or fort")
+    if entity.subtype == "fort":
+        return SelectionContext("fort", biome, entity, [entity], road_entrances=entrances, lod=3, reason="fort")
+    if entity.subtype == "castle":
+        return SelectionContext("castle", biome, entity, [entity], road_entrances=entrances, lod=3, reason="castle")
     if entity.subtype in {"wizard_tower", "mage_tower"}:
         return SelectionContext("mage_tower", biome, entity, [entity], road_entrances=entrances, lod=3, reason="mage tower")
-    if entity.subtype in {"cave", "dungeon_entrance", "mine"}:
+    if entity.subtype == "dragon_lair":
+        return SelectionContext("dragon_lair", biome, entity, [entity], road_entrances=entrances, lod=3, reason="dragon lair")
+    if entity.subtype == "bandit_camp":
+        return SelectionContext("bandit_camp", biome, entity, [entity], road_entrances=entrances, lod=3, reason="bandit camp")
+    if entity.subtype == "ruined_city":
+        return SelectionContext("ruined_city", biome, entity, [entity], road_entrances=entrances, lod=3, reason="ruined settlement")
+    if entity.subtype in {"cave", "cave_mouth", "dungeon_entrance", "mine"}:
+        if scene.metadata.get("terminal") or scene.kind in {"cavern", "dragon_lair"}:
+            return SelectionContext("terminal", biome, entity, [entity], road_entrances=entrances, lod=4, reason="terminal underground location")
+        if scene.kind == "cave":
+            return SelectionContext("cave_interior", biome, entity, [entity], road_entrances=entrances, lod=3, reason="entering cave interior")
         return SelectionContext("cave", biome, entity, [entity], road_entrances=entrances, lod=3, reason="cave or underground location")
     if entity.subtype in {"boat", "shipwreck", "sea_ruin", "ocean_monument", "island"}:
         return SelectionContext("ocean", biome, entity, [entity], lod=2, reason="ocean feature")

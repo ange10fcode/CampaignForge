@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import heapq
 import math
 import random
 from dataclasses import dataclass
@@ -26,6 +27,24 @@ class MapSettings:
     detail: int
     river_count: int
     settlement_count: int
+    temperature: int = 50
+    max_altitude: int = 70
+    moisture: int = 55
+    road_min_per_settlement: int = 0
+    road_max_per_settlement: int = 3
+    road_connection_chance: int = 68
+    rare_ruin_chance: int = 4
+    smooth_terrain: bool = False
+
+    def __post_init__(self) -> None:
+        self.temperature = max(0, min(100, int(self.temperature)))
+        self.max_altitude = max(0, min(100, int(self.max_altitude)))
+        self.moisture = max(0, min(100, int(self.moisture)))
+        self.road_min_per_settlement = max(0, min(8, int(self.road_min_per_settlement)))
+        self.road_max_per_settlement = max(self.road_min_per_settlement, min(8, int(self.road_max_per_settlement)))
+        self.road_connection_chance = max(0, min(100, int(self.road_connection_chance)))
+        self.rare_ruin_chance = max(0, min(25, int(self.rare_ruin_chance)))
+        self.smooth_terrain = bool(self.smooth_terrain)
 
 
 @dataclass
@@ -106,11 +125,13 @@ class FantasyMapGenerator:
     BEACH = (210, 194, 137)
     PLAINS = (146, 173, 105)
     DRY_PLAINS = (173, 168, 105)
+    DESERT = (204, 183, 111)
     FOREST = (73, 119, 74)
     DARK_FOREST = (47, 89, 60)
     HILLS = (133, 137, 87)
     MOUNTAIN = (111, 105, 94)
     SNOW = (220, 221, 211)
+    WETLANDS = (94, 132, 92)
     RIVER = (45, 117, 166)
     ROAD = (135, 104, 72)
     INK = (67, 54, 42)
@@ -130,6 +151,7 @@ class FantasyMapGenerator:
 
         self.elevation: list[list[float]] = []
         self.moisture: list[list[float]] = []
+        self.temperature: list[list[float]] = []
         self.land_mask: list[list[bool]] = []
         self.mountain_points: list[Point] = []
         self.settlements: list[Settlement] = []
@@ -137,7 +159,14 @@ class FantasyMapGenerator:
         self.road_paths: list[list[Point]] = []
         self.landmarks: list[Landmark] = []
 
-        self.tile = max(4, int(18 - settings.detail * 1.5))
+        base_tile = max(4, int(18 - settings.detail * 1.5))
+        self.tile = max(2, base_tile // 2) if settings.smooth_terrain else base_tile
+        altitude = settings.max_altitude / 100.0
+        heat = settings.temperature / 100.0
+        self.sea_level = max(0.22, min(0.46, 0.345 + altitude * 0.035 - (heat - 0.5) * 0.11))
+        self.coast_level = self.sea_level + 0.045
+        self.hill_level = 0.60 + (1.0 - altitude) * 0.16
+        self.mountain_level = 0.70 + (1.0 - altitude) * 0.17
         self.cols = math.ceil(settings.width / self.tile)
         self.rows = math.ceil(settings.height / self.tile)
 
@@ -161,24 +190,42 @@ class FantasyMapGenerator:
         gy = max(0, min(self.rows - 1, int(y / self.tile)))
         return self.land_mask[gy][gx]
 
-    def _terrain_color(self, elev: float, moist: float) -> Color:
-        if elev < 0.34:
+    def _local_temperature(self, elev: float, x_norm: float = 0.5, y_norm: float = 0.5) -> float:
+        base = self.settings.temperature / 100.0
+        latitude_cooling = abs(y_norm * 2.0 - 1.0) * 0.15
+        elevation_cooling = max(0.0, elev - self.coast_level) * (0.35 + self.settings.max_altitude / 170.0)
+        return max(0.0, min(1.0, base - latitude_cooling - elevation_cooling))
+
+    def _terrain_color(self, elev: float, moist: float, temp: Optional[float] = None) -> Color:
+        local_temp = self.settings.temperature / 100.0 if temp is None else temp
+        if elev < self.sea_level - 0.055:
             return self.DEEP_WATER
-        if elev < 0.40:
+        if elev < self.sea_level:
             return self.WATER
-        if elev < 0.44:
+        if elev < self.coast_level:
             return self.BEACH
-        if elev > 0.78:
-            return self.SNOW
-        if elev > 0.68:
+        if elev >= self.mountain_level:
+            if local_temp < 0.38 or elev > min(0.97, self.mountain_level + 0.14):
+                return self.SNOW
             return self.MOUNTAIN
-        if elev > 0.58:
+        if elev >= self.hill_level:
+            if local_temp < 0.24:
+                return self.SNOW
             return self.HILLS
-        if moist > 0.67:
+        if local_temp > 0.72 and moist < 0.48:
+            return self.DESERT
+        if local_temp > 0.62 and moist < 0.38:
+            return self.DRY_PLAINS
+        if local_temp < 0.24 and elev > self.coast_level + 0.06:
+            return self.SNOW
+        if moist > 0.78 and elev < self.hill_level - 0.08 and local_temp > 0.28:
+            return self.WETLANDS
+        forest_threshold = 0.52 + max(0.0, local_temp - 0.72) * 0.22
+        if moist > forest_threshold + 0.14:
             return self.DARK_FOREST
-        if moist > 0.53:
+        if moist > forest_threshold:
             return self.FOREST
-        if moist < 0.32:
+        if moist < 0.30:
             return self.DRY_PLAINS
         return self.PLAINS
 
@@ -199,48 +246,41 @@ class FantasyMapGenerator:
         yield
 
     def _stage_base_noise(self) -> Generator[None, None, None]:
-        self._progress("1/12 — Creating elevation and moisture fields", 0.01)
+        self._progress("1/12 — Creating elevation, moisture and temperature fields", 0.01)
+        altitude_strength = 0.25 + (self.settings.max_altitude / 100.0) * 1.05
+        heat = self.settings.temperature / 100.0
         for row in range(self.rows):
             elevation_row: list[float] = []
             moisture_row: list[float] = []
+            temperature_row: list[float] = []
             land_row: list[bool] = []
-
             for col in range(self.cols):
                 x = col * self.tile + self.tile / 2
                 y = row * self.tile + self.tile / 2
-
-                scale = 0.0045 + self.settings.detail * 0.00025
-                e = self.noise.fractal(x * scale, y * scale, octaves=6)
-                ridges = abs(
-                    self.noise.fractal(
-                        x * scale * 1.9 + 18.2,
-                        y * scale * 1.9 - 11.8,
-                        octaves=4,
-                    )
-                    * 2.0
-                    - 1.0
-                )
+                scale = 0.0042 + self.settings.detail * 0.00024
+                broad = self.noise.fractal(x * scale, y * scale, octaves=6)
+                ridges = 1.0 - abs(self.noise.fractal(x * scale * 1.85 + 18.2, y * scale * 1.85 - 11.8, octaves=4) * 2.0 - 1.0)
                 island = self._radial_island_bias(x, y)
-                e = e * 0.57 + island * 0.48 + ridges * 0.12 - 0.11
-                m = self.noise.fractal(
-                    x * scale * 1.3 + 93.1,
-                    y * scale * 1.3 + 47.7,
-                    octaves=5,
-                )
-
+                shaped = broad * 0.60 + island * 0.42 + ridges * (0.08 + altitude_strength * 0.08) - 0.07
+                e = 0.50 + (shaped - 0.50) * altitude_strength
+                if self.settings.max_altitude < 35:
+                    e = 0.50 + (e - 0.50) * 0.58
+                e = max(0.0, min(1.0, e))
+                m = self.noise.fractal(x * scale * 1.28 + 93.1, y * scale * 1.28 + 47.7, octaves=5)
+                moisture_bias = (self.settings.moisture - 50) / 100.0
+                m = m + moisture_bias * 0.72 - max(0.0, heat - 0.50) * 0.42
+                m = max(0.0, min(1.0, m))
+                t = self._local_temperature(e, x / max(1, self.settings.width), y / max(1, self.settings.height))
                 elevation_row.append(e)
                 moisture_row.append(m)
-                land_row.append(e >= 0.40)
-
+                temperature_row.append(t)
+                land_row.append(e >= self.sea_level)
             self.elevation.append(elevation_row)
             self.moisture.append(moisture_row)
+            self.temperature.append(temperature_row)
             self.land_mask.append(land_row)
-
             if row % 2 == 0:
-                self._progress(
-                    "1/12 — Creating elevation and moisture fields",
-                    0.01 + 0.07 * row / max(1, self.rows - 1),
-                )
+                self._progress("1/12 — Creating elevation, moisture and temperature fields", 0.01 + 0.07 * row / max(1, self.rows - 1))
                 yield
 
     def _stage_terrain_tiles(self) -> Generator[None, None, None]:
@@ -254,6 +294,7 @@ class FantasyMapGenerator:
                 color = self._terrain_color(
                     self.elevation[row][col],
                     self.moisture[row][col],
+                    self.temperature[row][col],
                 )
                 self.draw.rectangle((x0, y0, x1, y1), fill=color + (255,))
 
@@ -292,7 +333,7 @@ class FantasyMapGenerator:
             x = self.rng.randint(3, self.settings.width - 4)
             y = self.rng.randint(3, self.settings.height - 4)
             e = self._sample_grid(self.elevation, x, y)
-            if e >= 0.44 and e < 0.68:
+            if e >= self.coast_level and e < self.mountain_level:
                 radius = self.rng.choice((1, 1, 1, 2))
                 self.draw.ellipse(
                     (x - radius, y - radius, x + radius, y + radius),
@@ -313,7 +354,8 @@ class FantasyMapGenerator:
             for col in range(self.cols):
                 e = self.elevation[row][col]
                 m = self.moisture[row][col]
-                if 0.44 <= e < 0.63 and m > 0.53:
+                t = self.temperature[row][col]
+                if self.coast_level <= e < self.mountain_level and m > 0.52 and 0.20 < t < 0.86:
                     candidates.append((col, row, m))
 
         self.rng.shuffle(candidates)
@@ -362,163 +404,144 @@ class FantasyMapGenerator:
                 break
 
     def _stage_mountains(self) -> Generator[None, None, None]:
-        self._progress("6/12 — Raising mountain ranges", 0.45)
+        self._progress("6/12 — Shaping mountain ranges", 0.45)
         candidates: list[tuple[int, int, float]] = []
         for row in range(self.rows):
             for col in range(self.cols):
                 e = self.elevation[row][col]
-                if e > 0.64:
+                if e > self.hill_level:
                     candidates.append((col, row, e))
 
         self.rng.shuffle(candidates)
-        max_mountains = max(
-            12,
-            int(self.settings.width * self.settings.height / 8500),
-        )
-        selected = candidates[: max_mountains * 2]
-
-        for index, (col, row, elev) in enumerate(selected):
-            x = int((col + 0.25 + self.rng.random() * 0.5) * self.tile)
-            y = int((row + 0.3 + self.rng.random() * 0.4) * self.tile)
-            size = self.rng.randint(7, 13)
-            height = int(size * (1.2 + max(0.0, elev - 0.65) * 2.0))
-
-            left = (x - size, y + size)
-            peak = (x, y - height)
-            right = (x + size, y + size)
-
-            self.draw.polygon(
-                (left, peak, right),
-                fill=(101, 96, 87, 240),
-                outline=(67, 62, 57, 220),
-            )
-            self.draw.polygon(
-                (
-                    peak,
-                    (x - size // 3, y - height // 3),
-                    (x, y - height // 6),
-                    (x + size // 3, y - height // 3),
-                ),
-                fill=(223, 223, 213, 220),
-            )
-            self.draw.line(
-                (peak, x - size // 2, y + size // 2),
-                fill=(151, 147, 137, 150),
-                width=1,
-            )
+        max_samples = max(12, int(self.settings.width * self.settings.height / 11000))
+        for index, (col, row, elev) in enumerate(candidates[:max_samples]):
+            x = int((col + 0.5) * self.tile)
+            y = int((row + 0.5) * self.tile)
             self.mountain_points.append((x, y))
-
-            if index % 4 == 0:
-                self._progress(
-                    "6/12 — Raising mountain ranges",
-                    0.45 + 0.08 * index / max(1, len(selected)),
-                )
+            if index % 2 == 0:
+                shade = int(30 + max(0.0, elev - self.hill_level) * 80)
+                span = max(2, self.tile // 3)
+                self.draw.line((x-span, y+span//2, x, y-span//2, x+span, y+span//2), fill=(55, 52, 48, shade), width=1)
+            if index % 8 == 0:
+                self._progress("6/12 — Shaping mountain ranges", 0.45 + 0.08 * index / max(1, min(len(candidates), max_samples)))
                 yield
 
-    def _find_high_land_point(self) -> Optional[Point]:
-        choices: list[Point] = []
-        for _ in range(500):
-            x = self.rng.randint(10, self.settings.width - 11)
-            y = self.rng.randint(10, self.settings.height - 11)
-            e = self._sample_grid(self.elevation, x, y)
-            if e > 0.62:
-                choices.append((x, y))
-        if not choices:
+    def _find_high_land_cell(self) -> Optional[tuple[int, int]]:
+        threshold = max(self.hill_level, self.coast_level + 0.13)
+        candidates: list[tuple[float, int, int]] = []
+        for row in range(1, self.rows - 1):
+            for col in range(1, self.cols - 1):
+                e = self.elevation[row][col]
+                if e >= threshold and self.land_mask[row][col]:
+                    candidates.append((e + self.rng.random() * 0.08, col, row))
+        if not candidates:
             return None
-        return self.rng.choice(choices)
+        candidates.sort(reverse=True)
+        pool = candidates[: max(8, len(candidates) // 3)]
+        _, col, row = self.rng.choice(pool)
+        return col, row
 
-    def _nearest_water_direction(self, x: float, y: float) -> Point:
-        best_angle = self.rng.random() * math.tau
-        best_score = float("inf")
-        for i in range(16):
-            angle = i / 16 * math.tau
-            tx = x + math.cos(angle) * 60
-            ty = y + math.sin(angle) * 60
-            if not (0 <= tx < self.settings.width and 0 <= ty < self.settings.height):
-                return math.cos(angle), math.sin(angle)
-            score = self._sample_grid(self.elevation, tx, ty)
-            if score < best_score:
-                best_score = score
-                best_angle = angle
-        return math.cos(best_angle), math.sin(best_angle)
+    def _river_path_from(self, source: tuple[int, int], occupied: set[tuple[int, int]]) -> list[Point]:
+        col, row = source
+        visited: set[tuple[int, int]] = set()
+        cells: list[tuple[int, int]] = []
+        previous_dir: Optional[tuple[int, int]] = None
+        for _ in range(max(self.cols, self.rows) * 5):
+            if (col, row) in visited:
+                break
+            visited.add((col, row))
+            cells.append((col, row))
+            e = self.elevation[row][col]
+            if e < self.sea_level + 0.01 and len(cells) > 5:
+                break
+            if (col, row) in occupied and len(cells) > 6:
+                break
+            choices: list[tuple[float, int, int, int, int]] = []
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if dx == 0 and dy == 0:
+                        continue
+                    nc, nr = col + dx, row + dy
+                    if not (0 <= nc < self.cols and 0 <= nr < self.rows) or (nc, nr) in visited:
+                        continue
+                    ne = self.elevation[nr][nc]
+                    downhill = ne - e
+                    turn_penalty = 0.0
+                    if previous_dir is not None:
+                        dot = dx * previous_dir[0] + dy * previous_dir[1]
+                        turn_penalty = 0.012 if dot <= 0 else (0.004 if dot == 1 else 0.0)
+                    merge_bonus = -0.08 if (nc, nr) in occupied else 0.0
+                    edge_distance = min(nc, nr, self.cols - 1 - nc, self.rows - 1 - nr)
+                    edge_pull = edge_distance * 0.00025
+                    noise = (self.noise.value(nc * 0.17 + 41.0, nr * 0.17 - 13.0) - 0.5) * 0.008
+                    uphill_penalty = max(0.0, downhill) * 3.5
+                    score = ne + uphill_penalty + turn_penalty + edge_pull + noise + merge_bonus
+                    choices.append((score, nc, nr, dx, dy))
+            if not choices:
+                break
+            choices.sort(key=lambda item: item[0])
+            _, nc, nr, dx, dy = choices[0]
+            if self.elevation[nr][nc] > e + 0.055 and len(cells) > 8:
+                break
+            col, row = nc, nr
+            previous_dir = (dx, dy)
+        if len(cells) < 5:
+            return []
+        points: list[Point] = []
+        for index, (c, r) in enumerate(cells):
+            x = (c + 0.5) * self.tile
+            y = (r + 0.5) * self.tile
+            if 0 < index < len(cells) - 1:
+                pc, pr = cells[index - 1]
+                nc, nr = cells[index + 1]
+                dx, dy = nc - pc, nr - pr
+                ln = max(1.0, math.hypot(dx, dy))
+                px, py = -dy / ln, dx / ln
+                jitter = (self.noise.value(c * 0.31 + 7.0, r * 0.31 + 19.0) - 0.5) * self.tile * 0.30
+                x += px * jitter
+                y += py * jitter
+            points.append((max(1.0, min(self.settings.width - 2.0, x)), max(1.0, min(self.settings.height - 2.0, y))))
+        return points
 
     def _stage_rivers(self) -> Generator[None, None, None]:
-        self._progress("7/12 — Carving rivers", 0.54)
-
-        for river_index in range(self.settings.river_count):
-            source = self._find_high_land_point()
-            if source is None:
+        self._progress("7/12 — Carving terrain-driven rivers", 0.54)
+        occupied: set[tuple[int, int]] = set()
+        attempts = 0
+        made = 0
+        if self.settings.river_count > 0:
+            target_rivers = self.settings.river_count
+        else:
+            moisture_factor = self.settings.moisture / 100.0
+            altitude_factor = self.settings.max_altitude / 100.0
+            area_factor = max(0.55, (self.settings.width * self.settings.height) / (1400 * 900))
+            target_rivers = int(round((1.0 + moisture_factor * 6.0 + altitude_factor * 2.4) * math.sqrt(area_factor)))
+            if self.settings.moisture < 18:
+                target_rivers = max(0, target_rivers - 2)
+            target_rivers = max(0, min(14, target_rivers))
+        self.metadata_auto_river_count = target_rivers
+        while made < target_rivers and attempts < max(10, target_rivers * 14):
+            attempts += 1
+            source = self._find_high_land_cell()
+            if source is None or source in occupied:
                 continue
-
-            x, y = source
-            path: list[Point] = [(x, y)]
-            heading = self.rng.random() * math.tau
-
-            for step in range(180):
-                current_e = self._sample_grid(self.elevation, x, y)
-                if current_e < 0.405 and step > 10:
-                    break
-
-                best: Optional[tuple[float, float, float]] = None
-                for turn in (-1.2, -0.8, -0.4, 0, 0.4, 0.8, 1.2):
-                    angle = heading + turn
-                    nx = x + math.cos(angle) * self.tile * 0.75
-                    ny = y + math.sin(angle) * self.tile * 0.75
-
-                    if not (
-                        3 <= nx < self.settings.width - 3
-                        and 3 <= ny < self.settings.height - 3
-                    ):
-                        continue
-
-                    elev = self._sample_grid(self.elevation, nx, ny)
-                    meander = self.noise.value(nx * 0.025, ny * 0.025) * 0.025
-                    score = elev + abs(turn) * 0.006 + meander
-
-                    if best is None or score < best[0]:
-                        best = (score, nx, ny)
-
-                if best is None:
-                    break
-
-                _, nx, ny = best
-                dx = nx - x
-                dy = ny - y
-                heading = math.atan2(dy, dx)
-                x, y = nx, ny
-                path.append((x, y))
-
-                if step % 7 == 0 and len(path) > 2:
-                    width = max(2, min(7, 2 + len(path) // 25))
-                    self.draw.line(
-                        path[-8:],
-                        fill=self.RIVER + (235,),
-                        width=width + 2,
-                        joint="curve",
-                    )
-                    self.draw.line(
-                        path[-8:],
-                        fill=(92, 166, 198, 245),
-                        width=width,
-                        joint="curve",
-                    )
-                    self._progress(
-                        f"7/12 — Carving river {river_index + 1}/{self.settings.river_count}",
-                        0.54
-                        + 0.08
-                        * (
-                            river_index + step / 180
-                        )
-                        / max(1, self.settings.river_count),
-                    )
-                    yield
-
-            if len(path) > 4:
-                self.river_paths.append(path)
+            path = self._river_path_from(source, occupied)
+            if len(path) < 5:
+                continue
+            self.river_paths.append(path)
+            for x, y in path:
+                occupied.add((max(0, min(self.cols - 1, int(x / self.tile))), max(0, min(self.rows - 1, int(y / self.tile)))))
+            width = max(2, min(7, 2 + len(path) // 28))
+            for end in range(3, len(path) + 1, 7):
+                segment = path[max(0, end - 10):end]
+                self.draw.line(segment, fill=self.RIVER + (235,), width=width + 2, joint="curve")
+                self.draw.line(segment, fill=(92, 166, 198, 245), width=width, joint="curve")
+                self._progress(f"7/12 — Carving river {made + 1}/{target_rivers}", 0.54 + 0.08 * (made + end / max(1, len(path))) / max(1, target_rivers))
+                yield
+            made += 1
 
     def _valid_settlement_point(self, x: int, y: int) -> bool:
         e = self._sample_grid(self.elevation, x, y)
-        if not (0.44 <= e < 0.64):
+        if not (self.coast_level + 0.015 <= e < self.mountain_level - 0.015):
             return False
         for settlement in self.settlements:
             if math.dist((x, y), (settlement.x, settlement.y)) < 70:
@@ -594,6 +617,11 @@ class FantasyMapGenerator:
 
         if settlement.kind == "castle":
             self._draw_castle(x, y)
+        elif settlement.kind == "city":
+            offsets = [(-18,-10),(0,-13),(18,-9),(-21,7),(-5,5),(12,8),(24,6),(-10,20),(10,20)]
+            for ox, oy in offsets:
+                self._draw_house(x + ox, y + oy)
+            self.draw.ellipse((x-30,y-27,x+30,y+27), outline=(82,67,47,160), width=3)
         elif settlement.kind == "town":
             offsets = [(-12, -5), (3, -8), (-4, 9), (14, 7)]
             for ox, oy in offsets:
@@ -643,6 +671,8 @@ class FantasyMapGenerator:
             index = len(self.settlements)
             if index == 0:
                 kind = "castle"
+            elif index % 7 == 1:
+                kind = "city"
             elif index % 4 == 0:
                 kind = "town"
             else:
@@ -658,89 +688,183 @@ class FantasyMapGenerator:
             )
             yield
 
-    def _curved_road(self, a: Settlement, b: Settlement) -> list[Point]:
-        points: list[Point] = []
-        steps = max(12, int(math.dist((a.x, a.y), (b.x, b.y)) / 12))
-        bend = self.rng.uniform(-0.22, 0.22)
-        dx = b.x - a.x
-        dy = b.y - a.y
-        perp_x = -dy
-        perp_y = dx
-        length = max(1.0, math.hypot(perp_x, perp_y))
-        perp_x /= length
-        perp_y /= length
+    def _road_cell_cost(self, col: int, row: int, prev: Optional[tuple[int, int]] = None) -> float:
+        if not (0 <= col < self.cols and 0 <= row < self.rows):
+            return float("inf")
+        if not self.land_mask[row][col]:
+            return float("inf")
+        e = self.elevation[row][col]
+        m = self.moisture[row][col]
+        t = self.temperature[row][col]
+        color = self._terrain_color(e, m, t)
+        if color == self.MOUNTAIN or color == self.SNOW:
+            base = 8.5
+        elif color == self.HILLS:
+            base = 3.8
+        elif color in {self.FOREST, self.DARK_FOREST}:
+            base = 2.2
+        elif color == self.DESERT:
+            base = 1.8
+        elif color == self.BEACH:
+            base = 2.7
+        else:
+            base = 1.0
+        if prev is not None:
+            pc, pr = prev
+            if 0 <= pc < self.cols and 0 <= pr < self.rows:
+                slope = abs(e - self.elevation[pr][pc])
+                base += slope * (34.0 + self.settings.max_altitude * 0.22)
+        return base
 
-        for i in range(steps + 1):
-            t = i / steps
-            arc = math.sin(math.pi * t) * bend * math.dist((a.x, a.y), (b.x, b.y))
-            jitter = (
-                self.noise.value(
-                    (a.x + dx * t) * 0.04,
-                    (a.y + dy * t) * 0.04,
-                )
-                - 0.5
-            ) * 8
-            x = a.x + dx * t + perp_x * (arc + jitter)
-            y = a.y + dy * t + perp_y * (arc + jitter)
-            points.append((x, y))
-        return points
+    def _road_astar(self, a: Settlement, b: Settlement) -> list[Point]:
+        start = (max(0, min(self.cols - 1, int(a.x / self.tile))), max(0, min(self.rows - 1, int(a.y / self.tile))))
+        goal = (max(0, min(self.cols - 1, int(b.x / self.tile))), max(0, min(self.rows - 1, int(b.y / self.tile))))
+        if start == goal:
+            return [(a.x, a.y), (b.x, b.y)]
+        queue: list[tuple[float, float, tuple[int, int]]] = [(0.0, 0.0, start)]
+        came: dict[tuple[int, int], tuple[int, int]] = {}
+        gscore = {start: 0.0}
+        visited = 0
+        max_visit = max(2500, self.cols * self.rows * 2)
+        while queue and visited < max_visit:
+            _, current_g, current = heapq.heappop(queue)
+            if current_g != gscore.get(current):
+                continue
+            visited += 1
+            if current == goal:
+                break
+            c, r = current
+            for dc, dr in ((1,0),(-1,0),(0,1),(0,-1),(1,1),(1,-1),(-1,1),(-1,-1)):
+                nc, nr = c + dc, r + dr
+                step_cost = self._road_cell_cost(nc, nr, current)
+                if not math.isfinite(step_cost):
+                    continue
+                diagonal = 1.414 if dc and dr else 1.0
+                tentative = current_g + step_cost * diagonal
+                node = (nc, nr)
+                if tentative >= gscore.get(node, float("inf")):
+                    continue
+                came[node] = current
+                gscore[node] = tentative
+                heuristic = math.hypot(goal[0] - nc, goal[1] - nr)
+                heapq.heappush(queue, (tentative + heuristic, tentative, node))
+        if goal not in came:
+            return []
+        cells = [goal]
+        cur = goal
+        while cur != start:
+            cur = came[cur]
+            cells.append(cur)
+        cells.reverse()
+        points: list[Point] = [(a.x, a.y)]
+        for c, r in cells[1:-1]:
+            points.append(((c + 0.5) * self.tile, (r + 0.5) * self.tile))
+        points.append((b.x, b.y))
+        if len(points) <= 3:
+            return points
+        smoothed = [points[0]]
+        for i in range(1, len(points) - 1):
+            px, py = points[i - 1]
+            x, y = points[i]
+            nx, ny = points[i + 1]
+            smoothed.append(((px + x * 2 + nx) / 4.0, (py + y * 2 + ny) / 4.0))
+        smoothed.append(points[-1])
+        return smoothed
+
+    def _road_edges(self) -> list[tuple[int, int]]:
+        n = len(self.settlements)
+        if n < 2:
+            return []
+        min_roads = self.settings.road_min_per_settlement
+        max_roads = self.settings.road_max_per_settlement
+        if max_roads <= 0:
+            return []
+
+        importance = {"city": 4, "castle": 3, "town": 2, "village": 1}
+        desired: list[int] = []
+        for settlement in self.settlements:
+            cap = max_roads
+            if settlement.kind == "village":
+                cap = min(cap, 2)
+            elif settlement.kind == "town":
+                cap = min(cap, max(2, max_roads))
+            lo = min(min_roads, cap)
+            desired.append(self.rng.randint(lo, cap) if cap >= lo else 0)
+
+        degree = [0] * n
+        diagonal = math.hypot(self.settings.width, self.settings.height)
+        candidates: list[tuple[float, int, int]] = []
+        for i in range(n):
+            for j in range(i + 1, n):
+                a, b = self.settlements[i], self.settlements[j]
+                d = math.dist((a.x, a.y), (b.x, b.y))
+                imp = max(importance.get(a.kind, 1), importance.get(b.kind, 1))
+                max_distance = diagonal * (0.22 + 0.045 * imp)
+                long_trade_route = imp >= 3 and d <= diagonal * 0.42 and self.rng.random() < 0.16
+                if d > max_distance and not long_trade_route:
+                    continue
+                score = d / (1.0 + 0.12 * imp) * self.rng.uniform(0.94, 1.08)
+                candidates.append((score, i, j))
+        candidates.sort()
+
+        edges: list[tuple[int, int]] = []
+        edge_set: set[tuple[int, int]] = set()
+        for _, i, j in candidates:
+            if degree[i] >= desired[i] or degree[j] >= desired[j]:
+                continue
+            base_chance = self.settings.road_connection_chance
+            ai, bj = self.settlements[i], self.settlements[j]
+            if ai.kind == "castle" or bj.kind == "castle":
+                base_chance = min(100, base_chance + 14)
+            if ai.kind == "village" and bj.kind == "village":
+                base_chance = max(0, base_chance - 18)
+            need = degree[i] < min(min_roads, desired[i]) or degree[j] < min(min_roads, desired[j])
+            if not need and self.rng.randrange(100) >= base_chance:
+                continue
+            pair = (i, j)
+            edges.append(pair)
+            edge_set.add(pair)
+            degree[i] += 1
+            degree[j] += 1
+
+        for i in range(n):
+            required = min(min_roads, desired[i])
+            while degree[i] < required:
+                options = []
+                for score, a, b in candidates:
+                    if i not in (a, b):
+                        continue
+                    j = b if a == i else a
+                    pair = (min(i, j), max(i, j))
+                    if pair in edge_set or degree[j] >= desired[j]:
+                        continue
+                    options.append((score, j))
+                if not options:
+                    break
+                _, j = min(options)
+                pair = (min(i, j), max(i, j))
+                edges.append(pair)
+                edge_set.add(pair)
+                degree[i] += 1
+                degree[j] += 1
+        return edges
 
     def _stage_roads(self) -> Generator[None, None, None]:
-        self._progress("9/12 — Connecting roads", 0.71)
-        if len(self.settlements) < 2:
+        self._progress("9/12 — Routing terrain-aware roads", 0.71)
+        if len(self.settlements) < 2 or self.settings.road_max_per_settlement <= 0:
             yield
             return
-
-        connected = {0}
-        remaining = set(range(1, len(self.settlements)))
-        edges: list[tuple[int, int]] = []
-        while remaining:
-            best: Optional[tuple[float, int, int]] = None
-            for i in connected:
-                for j in remaining:
-                    a = self.settlements[i]
-                    b = self.settlements[j]
-                    distance = math.dist((a.x, a.y), (b.x, b.y))
-                    if best is None or distance < best[0]:
-                        best = (distance, i, j)
-            if best is None:
-                break
-            _, i, j = best
-            edges.append((i, j))
-            connected.add(j)
-            remaining.remove(j)
-        if len(self.settlements) >= 4:
-            for _ in range(max(1, len(self.settlements) // 4)):
-                i, j = self.rng.sample(range(len(self.settlements)), 2)
-                if (i, j) not in edges and (j, i) not in edges:
-                    edges.append((i, j))
-
+        edges = self._road_edges()
         for edge_index, (i, j) in enumerate(edges):
-            path = self._curved_road(self.settlements[i], self.settlements[j])
+            path = self._road_astar(self.settlements[i], self.settlements[j])
+            if len(path) < 2:
+                continue
             self.road_paths.append(path)
-            for point_index in range(2, len(path) + 1, 3):
-                segment = path[max(0, point_index - 5):point_index]
-                self.draw.line(
-                    segment,
-                    fill=(74, 58, 42, 130),
-                    width=5,
-                    joint="curve",
-                )
-                self.draw.line(
-                    segment,
-                    fill=self.ROAD + (230,),
-                    width=3,
-                    joint="curve",
-                )
-                self._progress(
-                    f"9/12 — Building road {edge_index + 1}/{len(edges)}",
-                    0.71
-                    + 0.08
-                    * (
-                        edge_index + point_index / max(1, len(path))
-                    )
-                    / max(1, len(edges)),
-                )
+            for point_index in range(2, len(path) + 1, 5):
+                segment = path[max(0, point_index - 8):point_index]
+                self.draw.line(segment, fill=(74, 58, 42, 130), width=5, joint="curve")
+                self.draw.line(segment, fill=self.ROAD + (230,), width=3, joint="curve")
+                self._progress(f"9/12 — Routing road {edge_index + 1}/{max(1, len(edges))}", 0.71 + 0.08 * (edge_index + point_index / max(1, len(path))) / max(1, len(edges)))
                 yield
 
     @staticmethod
@@ -831,6 +955,40 @@ class FantasyMapGenerator:
             )
             yield
 
+    def _draw_landmark_symbol(self, x: int, y: int, kind: str) -> None:
+        ink = self.INK + (255,)
+        if kind in {"wizard_tower"}:
+            self.draw.rectangle((x-5,y-8,x+5,y+8),fill=(126,119,111,255),outline=ink,width=2)
+            self.draw.polygon(((x-9,y-7),(x,y-17),(x+9,y-7)),fill=(84,68,101,255),outline=ink)
+        elif kind == "dragon_lair":
+            self.draw.arc((x-12,y-8,x+12,y+13),180,360,fill=ink,width=4)
+            self.draw.ellipse((x-7,y,x+7,y+8),fill=(48,43,38,255))
+            self.draw.polygon(((x-14,y-4),(x-5,y-1),(x-10,y+6),(x,y+2),(x+10,y+6),(x+5,y-1),(x+14,y-4),(x,y-1)),fill=(145,65,52,220))
+        elif kind == "bandit_camp":
+            self.draw.polygon(((x-11,y+8),(x,y-10),(x+11,y+8)),fill=(148,124,87,255),outline=ink)
+            self.draw.line((x,y-10,x,y+8),fill=(91,66,43,255),width=2)
+        elif kind == "fort":
+            self.draw.rectangle((x-11,y-9,x+11,y+9),fill=(133,127,116,220),outline=ink,width=2)
+            for tx,ty in ((x-11,y-9),(x+11,y-9),(x-11,y+9),(x+11,y+9)):
+                self.draw.rectangle((tx-3,ty-3,tx+3,ty+3),fill=(108,103,96,255),outline=ink)
+        elif kind == "ruined_city":
+            self.draw.line((x-11,y+8,x-11,y-5,x-3,y-5,x-3,y+3,x+4,y+3,x+4,y-8,x+11,y-8,x+11,y+8),fill=(102,96,86,255),width=4)
+            self.draw.line((x-13,y+8,x+13,y+8),fill=ink,width=2)
+        elif kind in {"cave","mine","dungeon_entrance"}:
+            self.draw.arc((x-12,y-9,x+12,y+13),180,360,fill=ink,width=4)
+            self.draw.ellipse((x-7,y,x+7,y+8),fill=(48,43,38,255))
+        elif kind in {"temple"}:
+            self.draw.polygon(((x-11,y+8),(x,y-10),(x+11,y+8)),fill=(177,164,132,255),outline=ink)
+            self.draw.rectangle((x-7,y+2,x+7,y+9),fill=(177,164,132,255),outline=ink)
+        elif kind == "standing_stones":
+            self.draw.rectangle((x-9,y-8,x-4,y+8),fill=(111,106,96,220))
+            self.draw.rectangle((x+3,y-11,x+9,y+7),fill=(111,106,96,220))
+            self.draw.line((x-13,y+8,x+13,y+8),fill=ink,width=2)
+        else:
+            self.draw.rectangle((x-8,y-7,x-3,y+8),fill=(111,106,96,220))
+            self.draw.rectangle((x+2,y-10,x+8,y+7),fill=(111,106,96,220))
+            self.draw.line((x-12,y+8,x+12,y+8),fill=ink,width=2)
+
     def _stage_landmarks(self) -> Generator[None, None, None]:
         self._progress("11/12 — Adding campaign landmarks", 0.84)
         landmark_names = [
@@ -841,19 +999,29 @@ class FantasyMapGenerator:
             "Cursed Barrow",
             "Old Mine",
             "Bandit Camp",
+            "Ruined Settlement",
+            "Old Fort",
             "Standing Stones",
+            "Broken Watchtower",
+            "Abandoned House",
         ]
-        count = max(4, self.settings.settlement_count // 2)
+        base_count = max(2, self.settings.settlement_count // 3)
+        extra_ruins = max(0, int(self.cols * self.rows * (self.settings.rare_ruin_chance / 100.0) / 180))
+        count = base_count + extra_ruins
 
         kind_map = {
             "Ancient Ruins": "ruin",
             "Wizard Tower": "wizard_tower",
-            "Dragon Lair": "cave",
+            "Dragon Lair": "dragon_lair",
             "Forgotten Shrine": "temple",
             "Cursed Barrow": "dungeon_entrance",
             "Old Mine": "mine",
-            "Bandit Camp": "camp",
+            "Bandit Camp": "bandit_camp",
+            "Ruined Settlement": "ruined_city",
+            "Old Fort": "fort",
             "Standing Stones": "standing_stones",
+            "Broken Watchtower": "ruin",
+            "Abandoned House": "ruin",
         }
         for index in range(count):
             name = landmark_names[index % len(landmark_names)]
@@ -867,14 +1035,15 @@ class FantasyMapGenerator:
                 terrain = self._terrain_color(
                     self._sample_grid(self.elevation, x, y),
                     self._sample_grid(self.moisture, x, y),
+                    self._sample_grid(self.temperature, x, y),
                 )
-                if kind == "cave" and terrain not in {self.HILLS, self.MOUNTAIN, self.FOREST, self.DARK_FOREST}:
+                if kind in {"cave", "dragon_lair"} and terrain not in {self.HILLS, self.MOUNTAIN, self.FOREST, self.DARK_FOREST, self.SNOW}:
                     continue
                 if kind == "mine" and terrain not in {self.HILLS, self.MOUNTAIN, self.FOREST, self.DARK_FOREST}:
                     continue
                 if kind == "wizard_tower" and terrain in {self.BEACH, self.SNOW}:
                     continue
-                if kind == "camp" and terrain in {self.MOUNTAIN, self.SNOW}:
+                if kind == "bandit_camp" and terrain in {self.MOUNTAIN, self.SNOW}:
                     continue
                 if any(math.dist((x, y), (s.x, s.y)) < 45 for s in self.settlements):
                     continue
@@ -887,57 +1056,7 @@ class FantasyMapGenerator:
                 continue
 
             self.landmarks.append(Landmark(x, y, kind, name))
-            symbol = index % 4
-
-            if symbol == 0:
-                self.draw.rectangle(
-                    (x - 8, y - 7, x - 3, y + 8),
-                    fill=(111, 106, 96, 220),
-                )
-                self.draw.rectangle(
-                    (x + 2, y - 10, x + 8, y + 7),
-                    fill=(111, 106, 96, 220),
-                )
-                self.draw.line(
-                    (x - 12, y + 8, x + 12, y + 8),
-                    fill=self.INK + (220,),
-                    width=2,
-                )
-            elif symbol == 1:
-                self.draw.ellipse(
-                    (x - 7, y - 8, x + 7, y + 8),
-                    fill=(126, 119, 111, 255),
-                    outline=self.INK + (255,),
-                    width=2,
-                )
-                self.draw.polygon(
-                    ((x - 9, y - 7), (x, y - 18), (x + 9, y - 7)),
-                    fill=(84, 68, 101, 255),
-                    outline=self.INK + (255,),
-                )
-            elif symbol == 2:
-                self.draw.arc(
-                    (x - 12, y - 9, x + 12, y + 13),
-                    180,
-                    360,
-                    fill=self.INK + (255,),
-                    width=4,
-                )
-                self.draw.ellipse(
-                    (x - 7, y, x + 7, y + 8),
-                    fill=(48, 43, 38, 255),
-                )
-            else:
-                self.draw.polygon(
-                    ((x - 10, y + 7), (x, y - 10), (x + 10, y + 7)),
-                    fill=(158, 119, 77, 255),
-                    outline=self.INK + (255,),
-                )
-                self.draw.line(
-                    (x, y - 10, x, y + 7),
-                    fill=self.INK + (220,),
-                    width=1,
-                )
+            self._draw_landmark_symbol(x, y, kind)
 
             self.draw.text(
                 (x, y + 12),

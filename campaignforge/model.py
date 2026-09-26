@@ -15,10 +15,16 @@ SCENE_LEVELS = {
     "town": 3,
     "castle": 3,
     "cave": 3,
+    "cavern": 4,
+    "dragon_lair": 3,
+    "bandit_camp": 3,
+    "fort": 3,
     "mage_tower": 3,
     "street": 4,
-    "building": 5,
-    "room": 6,
+    "building_section": 5,
+    "building": 6,
+    "floor": 6,
+    "room": 7,
 }
 
 
@@ -39,15 +45,57 @@ class GenerationConfig:
     ocean_structures: bool = True
     underground: bool = True
 
+    temperature: int = 50
+    max_altitude: int = 70
+    moisture: int = 55
+    road_min_per_settlement: int = 0
+    road_max_per_settlement: int = 3
+    road_connection_chance: int = 68
+    rare_ruin_chance: int = 4
+    snap_to_grid: bool = True
+    experimental_smooth_terrain: bool = False
+
+    def normalize(self) -> None:
+        self.temperature = max(0, min(100, int(self.temperature)))
+        self.max_altitude = max(0, min(100, int(self.max_altitude)))
+        self.moisture = max(0, min(100, int(self.moisture)))
+        self.road_min_per_settlement = max(0, min(8, int(self.road_min_per_settlement)))
+        self.road_max_per_settlement = max(self.road_min_per_settlement, min(8, int(self.road_max_per_settlement)))
+        self.road_connection_chance = max(0, min(100, int(self.road_connection_chance)))
+        self.rare_ruin_chance = max(0, min(25, int(self.rare_ruin_chance)))
+        self.snap_to_grid = bool(self.snap_to_grid)
+        self.experimental_smooth_terrain = bool(self.experimental_smooth_terrain)
+
     def to_dict(self) -> dict:
+        self.normalize()
         return asdict(self)
 
     @classmethod
     def from_dict(cls, data: dict | None) -> "GenerationConfig":
+        cfg = cls()
         if not data:
-            return cls()
-        allowed = {k: bool(v) for k, v in data.items() if k in cls.__dataclass_fields__}
-        return cls(**allowed)
+            return cfg
+        bool_fields = {
+            "towns", "houses", "roads", "ruins", "dungeons", "castles", "npcs", "boats",
+            "carts", "furniture", "wildlife", "decorations", "ocean_structures", "underground",
+            "snap_to_grid", "experimental_smooth_terrain",
+        }
+        int_fields = {
+            "temperature", "max_altitude", "moisture", "road_min_per_settlement", "road_max_per_settlement",
+            "road_connection_chance", "rare_ruin_chance",
+        }
+        for key, value in data.items():
+            if key not in cls.__dataclass_fields__:
+                continue
+            if key in bool_fields:
+                setattr(cfg, key, bool(value))
+            elif key in int_fields:
+                try:
+                    setattr(cfg, key, int(value))
+                except (TypeError, ValueError):
+                    pass
+        cfg.normalize()
+        return cfg
 
 
 @dataclass
@@ -162,6 +210,7 @@ class CampaignState:
     current_id: Optional[str] = None
     config: GenerationConfig = field(default_factory=GenerationConfig)
     title: str = "Untitled Campaign"
+    view_state: dict = field(default_factory=dict)
 
     def add_scene(self, scene: Scene) -> None:
         self.scenes[scene.id] = scene

@@ -24,21 +24,28 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt pyinstaller
 
+      - name: Run generator and persistence tests
+        run: |
+          python tests/smoke_generation.py
+          python tests/lod_and_editor_features.py
+          python tests/version2_features.py
+          python tests/update_110_features.py
+
       - name: Build portable executable
         run: python -m PyInstaller --noconfirm --clean CampaignForge.spec
 
       - name: Package artifact
         shell: powershell
-        run: Compress-Archive -Path dist\CampaignForge.exe -DestinationPath CampaignForge-Windows-Portable.zip
+        run: Compress-Archive -Path dist\CampaignForge.exe -DestinationPath CampaignForge-v1.1.0-Windows-Portable.zip
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: CampaignForge-Windows-Portable
-          path: CampaignForge-Windows-Portable.zip
+          name: CampaignForge-v1.1.0-Windows-Portable
+          path: CampaignForge-v1.1.0-Windows-Portable.zip
 
       - name: Attach to tagged release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: CampaignForge-Windows-Portable.zip
+          files: CampaignForge-v1.1.0-Windows-Portable.zip

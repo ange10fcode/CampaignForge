@@ -4,7 +4,7 @@ import math
 import random
 import uuid
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Generator, Optional
 
 from PIL import Image, ImageDraw
@@ -82,6 +82,51 @@ BUILDING_PROFILES = {
         "rooms": ["kitchen", "living room", "bedroom", "pantry"],
         "wall": (89, 66, 48),
     },
+    "apothecary": {
+        "floor": "wood",
+        "rooms": ["sales floor", "alchemy lab", "storage", "office"],
+        "wall": (75, 70, 52),
+    },
+    "bakery": {
+        "floor": "stone",
+        "rooms": ["sales floor", "kitchen", "pantry", "storage"],
+        "wall": (91, 69, 49),
+    },
+    "stable": {
+        "floor": "stone",
+        "rooms": ["stable", "tack room", "storage"],
+        "wall": (91, 69, 49),
+    },
+    "guild_hall": {
+        "floor": "wood",
+        "rooms": ["great hall", "office", "meeting room", "archive", "storage"],
+        "wall": (75, 59, 48),
+    },
+    "warehouse": {
+        "floor": "stone",
+        "rooms": ["storage", "storage", "office", "loading room"],
+        "wall": (81, 70, 58),
+    },
+    "government": {
+        "floor": "stone",
+        "rooms": ["great hall", "office", "archive", "meeting room"],
+        "wall": (86, 82, 76),
+    },
+    "noble_house": {
+        "floor": "wood",
+        "rooms": ["great hall", "bedchamber", "study", "kitchen", "guest room", "storage"],
+        "wall": (76, 59, 46),
+    },
+    "mage_shop": {
+        "floor": "wood",
+        "rooms": ["sales floor", "study", "alchemy lab", "storage"],
+        "wall": (69, 61, 77),
+    },
+    "barracks": {
+        "floor": "stone",
+        "rooms": ["barracks", "armory", "storage", "office"],
+        "wall": (76, 73, 67),
+    },
 }
 
 
@@ -103,7 +148,7 @@ class WorldSceneGenerator(SceneGenerator):
     def __init__(self, settings: MapSettings, config: GenerationConfig, status) -> None:
         super().__init__(status)
         if not config.towns:
-            settings = MapSettings(settings.width, settings.height, settings.seed, settings.detail, settings.river_count, 0)
+            settings = replace(settings, settlement_count=0)
         self.engine = FantasyMapGenerator(settings, status)
         self.image = self.engine.image
         self.settings = settings
@@ -124,11 +169,26 @@ class WorldSceneGenerator(SceneGenerator):
         for row in range(e.rows):
             out = []
             for col in range(e.cols):
-                color = e._terrain_color(e.elevation[row][col], e.moisture[row][col])
+                color = e._terrain_color(e.elevation[row][col], e.moisture[row][col], e.temperature[row][col])
                 out.append(_color_to_biome(color))
             grid.append(out)
         self.metadata["biome_grid"] = grid
         self.metadata["biome_grid_size"] = [e.cols, e.rows]
+        self.metadata["elevation_grid"] = [[round(v, 5) for v in row] for row in e.elevation]
+        self.metadata["moisture_grid"] = [[round(v, 5) for v in row] for row in e.moisture]
+        self.metadata["temperature_grid"] = [[round(v, 5) for v in row] for row in e.temperature]
+        self.metadata["world_settings"] = {
+            "temperature": self.settings.temperature,
+            "max_altitude": self.settings.max_altitude,
+            "moisture": self.settings.moisture,
+            "auto_river_count": len(e.river_paths),
+            "road_min_per_settlement": self.settings.road_min_per_settlement,
+            "road_max_per_settlement": self.settings.road_max_per_settlement,
+            "road_connection_chance": self.settings.road_connection_chance,
+            "rare_ruin_chance": self.settings.rare_ruin_chance,
+            "smooth_terrain": self.settings.smooth_terrain,
+            "sea_level": round(e.sea_level, 5),
+        }
         settlement_entities: list[Entity] = []
         for settlement in e.settlements:
             world_ref = str(uuid.uuid4())
@@ -139,8 +199,8 @@ class WorldSceneGenerator(SceneGenerator):
                 name=settlement.name,
                 x=settlement.x,
                 y=settlement.y,
-                width=48 if settlement.kind == "village" else (68 if settlement.kind == "castle" else 58),
-                height=48 if settlement.kind == "village" else (68 if settlement.kind == "castle" else 58),
+                width=48 if settlement.kind == "village" else (78 if settlement.kind == "city" else (68 if settlement.kind == "castle" else 58)),
+                height=48 if settlement.kind == "village" else (78 if settlement.kind == "city" else (68 if settlement.kind == "castle" else 58)),
                 metadata={
                     "biome": self._sample_engine_biome(settlement.x, settlement.y),
                     "world_ref": world_ref,
@@ -170,7 +230,7 @@ class WorldSceneGenerator(SceneGenerator):
                 continue
             if landmark.kind in {"ruin"} and not self.config.ruins:
                 continue
-            if landmark.kind in {"cave", "dungeon_entrance", "mine"} and not (self.config.underground or self.config.dungeons):
+            if landmark.kind in {"cave", "dragon_lair", "dungeon_entrance", "mine"} and not (self.config.underground or self.config.dungeons):
                 continue
             world_ref = str(uuid.uuid4())
             entity = Entity(
@@ -197,29 +257,27 @@ class WorldSceneGenerator(SceneGenerator):
             return
         draw = ImageDraw.Draw(self.image, "RGBA")
         anchors = [e for e in self.entities if e.kind == "settlement"]
-        for landmark in [e for e in self.entities if e.kind == "landmark" and e.subtype in {"wizard_tower", "cave"}]:
+        for landmark in [e for e in self.entities if e.kind == "landmark" and e.subtype in {"wizard_tower", "cave", "dragon_lair", "fort", "bandit_camp"}]:
             if not anchors:
                 break
             target = min(anchors, key=lambda e: math.hypot(e.x - landmark.x, e.y - landmark.y))
             distance = math.hypot(target.x - landmark.x, target.y - landmark.y)
-            if landmark.subtype == "cave" and distance > min(self.settings.width, self.settings.height) * 0.34:
+            diag = math.hypot(self.settings.width, self.settings.height)
+            max_fraction = {"fort": .26, "wizard_tower": .22, "cave": .16, "dragon_lair": .15, "bandit_camp": .17}.get(landmark.subtype, .18)
+            if distance > diag * max_fraction:
                 continue
-            steps = max(5, int(distance / 30))
-            points = []
-            for i in range(steps + 1):
-                t = i / steps
-                bend = math.sin(math.pi * t) * self.engine.rng.uniform(-18, 18)
-                dx, dy = target.x - landmark.x, target.y - landmark.y
-                ln = max(1.0, math.hypot(dx, dy))
-                nx, ny = -dy / ln, dx / ln
-                points.append((landmark.x + dx * t + nx * bend, landmark.y + dy * t + ny * bend))
-            kind = "road" if landmark.subtype == "wizard_tower" else "trail"
+            source_stub = type("RoadAnchor", (), {"x": int(landmark.x), "y": int(landmark.y)})()
+            target_stub = type("RoadAnchor", (), {"x": int(target.x), "y": int(target.y)})()
+            points = self.engine._road_astar(source_stub, target_stub)
+            if len(points) < 2:
+                continue
+            kind = "road" if landmark.subtype in {"wizard_tower", "fort"} else "trail"
             width = 3 if kind == "road" else 2
             draw.line(points, fill=(121, 91, 60, 175), width=width, joint="curve")
             self.paths.append({
                 "id": str(uuid.uuid4()),
                 "kind": kind,
-                "major": landmark.subtype == "wizard_tower",
+                "major": landmark.subtype in {"wizard_tower", "fort"},
                 "from_ref": landmark.metadata.get("world_ref"),
                 "to_ref": target.metadata.get("world_ref"),
                 "points": [[round(x, 2), round(y, 2)] for x, y in points],
@@ -228,7 +286,7 @@ class WorldSceneGenerator(SceneGenerator):
     def _sample_engine_biome(self, x: float, y: float) -> str:
         col = max(0, min(self.engine.cols - 1, int(x / self.engine.tile)))
         row = max(0, min(self.engine.rows - 1, int(y / self.engine.tile)))
-        color = self.engine._terrain_color(self.engine.elevation[row][col], self.engine.moisture[row][col])
+        color = self.engine._terrain_color(self.engine.elevation[row][col], self.engine.moisture[row][col], self.engine.temperature[row][col])
         return _color_to_biome(color)
 
 
@@ -374,7 +432,7 @@ class ContextRegionGenerator(SceneGenerator):
             self._inherited_entities.append(clone)
             if clone.kind == "settlement":
                 _draw_settlement_marker_lod(self.image, x, y, clone.subtype, clone.name, self.settings.lod)
-            elif clone.subtype in {"castle", "fort", "cave", "wizard_tower", "mage_tower", "ruin", "temple", "dungeon_entrance", "mine"}:
+            elif clone.subtype in {"castle", "fort", "cave", "dragon_lair", "bandit_camp", "ruined_city", "wizard_tower", "mage_tower", "ruin", "temple", "dungeon_entrance", "mine"}:
                 _draw_location_marker(self.image, x, y, clone.subtype, clone.name, self.settings.lod, self.assets)
             elif clone.kind == "building" and self.settings.lod >= 2:
                 _draw_topdown_building(self.image, clone, self.assets)
@@ -426,7 +484,7 @@ class ContextRegionGenerator(SceneGenerator):
             if any(math.hypot(x - e.x, y - e.y) < spacing for e in self.entities):
                 continue
             name = _structure_name(kind, self.rng)
-            landmark_types = {"ruin", "cave", "shipwreck", "sea_ruin", "ocean_monument", "dungeon_entrance", "mine", "wizard_tower", "fort"}
+            landmark_types = {"ruin", "cave", "dragon_lair", "bandit_camp", "ruined_city", "shipwreck", "sea_ruin", "ocean_monument", "dungeon_entrance", "mine", "wizard_tower", "fort"}
             entity_kind = "landmark" if kind in landmark_types else "building"
             entity = Entity(
                 str(uuid.uuid4()), entity_kind, kind, name, x, y, 36, 36,
@@ -441,7 +499,7 @@ class ContextRegionGenerator(SceneGenerator):
             self.entities.append(entity)
             if kind in {"boat", "shipwreck", "sea_ruin", "ocean_monument"}:
                 _draw_ocean_feature(self.image, x, y, kind, self.assets)
-            elif kind in {"wizard_tower", "fort", "cave"}:
+            elif kind in {"wizard_tower", "fort", "cave", "dragon_lair", "bandit_camp", "ruined_city"}:
                 _draw_location_marker(self.image, x, y, kind, name, self.settings.lod, self.assets)
             else:
                 _draw_building(self.image, x, y, kind, self.assets, .75 if self.settings.lod <= 1 else .9)
@@ -454,7 +512,7 @@ class ContextRegionGenerator(SceneGenerator):
     def _connect_location_access(self) -> Generator[None, None, None]:
         locations = [
             e for e in self.entities
-            if e.metadata.get("generated_local") and e.subtype in {"fort", "castle", "wizard_tower", "cave"}
+            if e.metadata.get("generated_local") and e.subtype in {"fort", "castle", "wizard_tower", "cave", "dragon_lair", "bandit_camp"}
         ]
         anchors = [e for e in self.entities if e.kind == "settlement"]
         road_points = [
@@ -468,7 +526,7 @@ class ContextRegionGenerator(SceneGenerator):
                 continue
             tx, ty = min(candidates, key=lambda p: math.hypot(p[0] - loc.x, p[1] - loc.y))
             distance = math.hypot(tx - loc.x, ty - loc.y)
-            if loc.subtype == "cave" and distance > min(self.settings.width, self.settings.height) * .38:
+            if loc.subtype in {"cave", "dragon_lair", "bandit_camp"} and distance > min(self.settings.width, self.settings.height) * .32:
                 continue
             kind = "road" if loc.subtype in {"fort", "castle", "wizard_tower"} else "trail"
             points = _curved_connection((loc.x, loc.y), (tx, ty), self.rng, 10 if kind == "road" else 7)
@@ -503,6 +561,8 @@ class ContextRegionGenerator(SceneGenerator):
                 choices += ["house", "witch_hut", "inn", "wizard_tower"]
             if self.config.ruins:
                 choices += ["ruin", "cave"]
+            if self.config.dungeons and self.rng.random() < .12:
+                choices += ["dragon_lair"]
             if self.config.dungeons:
                 choices += ["dungeon_entrance"]
             if self.config.underground:
@@ -518,6 +578,8 @@ class ContextRegionGenerator(SceneGenerator):
                 choices += ["fort"]
             if self.config.ruins:
                 choices += ["ruin", "cave"]
+            if self.config.dungeons and self.rng.random() < .12:
+                choices += ["dragon_lair"]
             if self.config.dungeons:
                 choices += ["dungeon_entrance"]
             if self.config.underground:
@@ -592,12 +654,7 @@ class TownGenerator(SceneGenerator):
         cx, cy = w / 2, h / 2
         ring_rx = max(72, min(w, h) * .10)
         ring_ry = ring_rx * .78
-        entrances = list(self.road_entrances)
-        if not entrances:
-            count = 2 if self.settlement.subtype == "village" else 3
-            base = self.rng.uniform(-math.pi, math.pi)
-            entrances = [base + i * math.tau / count + self.rng.uniform(-.18, .18) for i in range(count)]
-        entrances = _dedupe_angles_local(entrances)[:5]
+        entrances = _dedupe_angles_local(list(self.road_entrances))[:6]
         ring = []
         for i in range(33):
             angle = i / 32 * math.tau
@@ -634,9 +691,9 @@ class TownGenerator(SceneGenerator):
 
     def _buildings(self) -> Generator[None, None, None]:
         base = self.settings.structure_count + (14 if self.settlement.subtype != "village" else 7)
-        target = max(20 if self.settlement.subtype == "village" else 28, base)
+        target = max(18 if self.settlement.subtype == "village" else (62 if self.settlement.subtype == "city" else (44 if self.settlement.subtype == "town" else 34)), base)
         used: list[tuple[float, float, float, float]] = []
-        candidates: list[tuple[float, float]] = []
+        candidates: list[tuple[float, float, float]] = []
         for path in self.road_paths:
             for idx in range(3, len(path) - 3, 2):
                 a = path[max(0, idx - 1)]
@@ -646,17 +703,20 @@ class TownGenerator(SceneGenerator):
                 nx, ny = -dy / ln, dx / ln
                 for side in (-1, 1):
                     offset = self.rng.uniform(34, 52)
-                    candidates.append((path[idx][0] + nx * offset * side, path[idx][1] + ny * offset * side))
+                    bx = path[idx][0] + nx * offset * side
+                    by = path[idx][1] + ny * offset * side
+                    entrance_angle = math.atan2(path[idx][1] - by, path[idx][0] - bx)
+                    candidates.append((bx, by, entrance_angle))
         self.rng.shuffle(candidates)
-        special = ["tavern", "blacksmith", "shop", "temple", "library"]
+        special = ["tavern", "blacksmith", "shop", "temple", "library", "apothecary", "bakery", "stable", "guild_hall", "warehouse", "mage_shop"]
         if self.settlement.subtype == "castle" and self.config.castles:
             special.insert(0, "castle")
         placed = 0
-        for x, y in candidates:
+        for x, y, entrance_angle in candidates:
             if placed >= target:
                 break
             btype = special[placed] if placed < len(special) else self.rng.choices(
-                ["house", "house", "house", "shop", "farmhouse"], weights=[6, 6, 6, 1, 1]
+                ["house", "house", "house", "shop", "farmhouse", "noble_house", "warehouse"], weights=[7, 7, 7, 2, 2, 1, 1]
             )[0]
             if btype in {"house", "farmhouse"} and not self.config.houses:
                 continue
@@ -670,7 +730,7 @@ class TownGenerator(SceneGenerator):
             used.append(rect)
             entity = Entity(
                 str(uuid.uuid4()), "building", btype, _building_name(btype, self.rng), x, y, bw, bh,
-                metadata={"biome": self.biome, "building_type": btype, "town": self.settlement.name},
+                metadata={"biome": self.biome, "building_type": btype, "town": self.settlement.name, "entrance_angle": round(entrance_angle, 6), "floor_count": _building_floor_count(btype, bw, bh, self.rng)},
             )
             self.entities.append(entity)
             _draw_topdown_building(self.image, entity, self.assets)
@@ -696,7 +756,14 @@ class TownGenerator(SceneGenerator):
         for i in range(count):
             x = self.rng.randint(15, self.settings.width-15)
             y = self.rng.randint(15, self.settings.height-15)
-            if any(math.hypot(x-px, y-py) < 22 for path in self.road_paths for px, py in path[::3]):
+            near_road = any(math.hypot(x-px, y-py) < 22 for path in self.road_paths for px, py in path[::3])
+            if near_road and self.rng.random() < .09:
+                subtype, label, ow, oh = self.rng.choice([
+                    ("bench","Bench",38,18),("barrel","Barrel",22,22),("crate","Crate",25,22),
+                    ("lamp","Street Lamp",18,28),("sign","Road Sign",24,28),("market_stall","Market Stall",52,34)
+                ])
+                self.entities.append(Entity(str(uuid.uuid4()),"object",subtype,label,x,y,ow,oh,movable=True,metadata={"biome":self.biome,"rotation":self.rng.choice([0,90,180,270]),"exterior":True}))
+            if near_road:
                 if self.config.carts and self.rng.random() < .05:
                     _draw_cart(self.image, x, y, self.assets)
                 elif self.rng.random() < .18:
@@ -847,29 +914,44 @@ class WildernessGenerator(SceneGenerator):
                 if i%20==0:
                     self._progress("Adding local terrain details",.22+.38*i/decor_count)
                     yield
-        choices=[]
+        regular_choices=[]
+        abandoned_choices=[]
         if self.biome in {"forest","dark_forest"}:
-            if self.config.houses: choices += ["witch_hut","house"]
-            if self.config.ruins: choices += ["ruin","cave"]
+            if self.config.houses: regular_choices += ["witch_hut","house"]
+            if self.config.ruins: abandoned_choices += ["ruin"]
+            if self.config.underground: regular_choices += ["cave"]
         elif self.biome in {"desert","dry_plains"}:
-            if self.config.ruins: choices += ["desert_temple","ruin"]
-            choices += ["oasis"]
+            regular_choices += ["oasis"]
+            if self.config.ruins: abandoned_choices += ["desert_temple","ruin"]
         elif self.biome in {"mountain","hills","snow"}:
-            if self.config.ruins: choices += ["cave","ruin"]
-            if self.config.castles: choices += ["fort"]
-            if self.config.dungeons: choices += ["dungeon_entrance"]
-            if self.config.underground: choices += ["mine"]
+            if self.config.underground: regular_choices += ["cave","mine"]
+            if self.config.castles: regular_choices += ["fort"]
+            if self.config.dungeons: regular_choices += ["dungeon_entrance"]
+            if self.config.ruins: abandoned_choices += ["ruin"]
         else:
-            if self.config.houses: choices += ["farm","house"]
-            if self.config.ruins: choices += ["ruin"]
-            if self.config.dungeons: choices += ["dungeon_entrance"]
-        for i in range(min(self.settings.landmark_count,len(choices)+3)):
-            kind=self.rng.choice(choices) if choices else None
-            if not kind or not compatible(kind,self.biome): continue
+            if self.config.houses: regular_choices += ["farm","house"]
+            if self.config.dungeons: regular_choices += ["dungeon_entrance"]
+            if self.config.ruins: abandoned_choices += ["ruin"]
+        max_regular = min(2, max(0, self.settings.landmark_count // 4))
+        if self.biome in {"plains", "forest", "dark_forest"}:
+            max_regular = min(max_regular, 1)
+        spawn_queue = [self.rng.choice(regular_choices) for _ in range(max_regular)] if regular_choices else []
+        if self.biome in {"plains", "forest", "dark_forest"}:
+            spawn_queue = [k for k in spawn_queue if k != "house" or self.rng.random() < .22]
+        ruin_rolls = max(1, self.settings.landmark_count // 2)
+        ruin_probability = max(0.0, min(0.25, self.config.rare_ruin_chance / 100.0))
+        for _ in range(ruin_rolls):
+            if abandoned_choices and self.rng.random() < ruin_probability:
+                spawn_queue.append(self.rng.choice(abandoned_choices))
+        for i,kind in enumerate(spawn_queue):
+            if not compatible(kind,self.biome):
+                continue
             x,y=self.rng.randint(60,self.settings.width-60),self.rng.randint(60,self.settings.height-60)
             _draw_building(self.image,x,y,kind,self.assets,.9)
-            self.entities.append(Entity(str(uuid.uuid4()),"building" if kind not in {"ruin","cave","dungeon_entrance","mine"} else "landmark",kind,_structure_name(kind,self.rng),x,y,44,44,metadata={"biome":self.biome,"building_type":_normalize_building_type(kind)}))
-            self._progress("Adding biome-valid structures",.65+.25*(i+1)/max(1,self.settings.landmark_count))
+            entity_kind = "building" if kind not in {"ruin","cave","dungeon_entrance","mine"} else "landmark"
+            metadata={"biome":self.biome,"building_type":_normalize_building_type(kind),"abandoned": kind in {"ruin","desert_temple"}}
+            self.entities.append(Entity(str(uuid.uuid4()),entity_kind,kind,_structure_name(kind,self.rng),x,y,44,44,metadata=metadata))
+            self._progress("Adding biome-valid structures",.65+.25*(i+1)/max(1,len(spawn_queue)))
             yield
         if self.config.wildlife and self.biome not in WATER_BIOMES:
             animals = ["Deer", "Wolf", "Boar"] if self.biome in {"forest", "dark_forest", "hills"} else ["Rabbit", "Fox"]
@@ -924,10 +1006,10 @@ class CastleGenerator(SceneGenerator):
             self.draw.line(pts, fill=(158, 122, 78, 255), width=14, joint="curve")
             self._progress("Connecting inherited castle roads", .20 + .12 * (i + 1) / max(1, len(entrances[:4])))
             yield
-        keep = Entity(str(uuid.uuid4()), "building", "castle", f"{self.location.name} Keep", cx, cy-35, 150, 105, metadata={"biome": self.biome, "building_type": "castle", "location": self.location.name})
+        keep = Entity(str(uuid.uuid4()), "building", "castle", f"{self.location.name} Keep", cx, cy-35, 150, 105, metadata={"biome": self.biome, "building_type": "castle", "location": self.location.name, "floor_count": self.rng.randint(3,5), "entrance_angle": round(gate_angle,6)})
         support = [
             Entity(str(uuid.uuid4()), "building", "blacksmith", "Castle Forge", cx-wall_w*.25, cy+wall_h*.20, 70, 48, metadata={"biome": self.biome, "building_type": "blacksmith"}),
-            Entity(str(uuid.uuid4()), "building", "house", "Barracks", cx+wall_w*.24, cy+wall_h*.20, 92, 52, metadata={"biome": self.biome, "building_type": "house"}),
+            Entity(str(uuid.uuid4()), "building", "barracks", "Barracks", cx+wall_w*.24, cy+wall_h*.20, 92, 52, metadata={"biome": self.biome, "building_type": "barracks", "floor_count": 2}),
             Entity(str(uuid.uuid4()), "building", "temple", "Castle Chapel", cx+wall_w*.25, cy-wall_h*.23, 66, 52, metadata={"biome": self.biome, "building_type": "temple"}),
         ]
         self.entities.append(keep)
@@ -1059,79 +1141,442 @@ class CaveGenerator(SceneGenerator):
         self._progress("Cave scene complete", 1.0)
         yield
 
+
+class FortGenerator(SceneGenerator):
+    def __init__(self, location: Entity, settings: DetailSettings, config: GenerationConfig, assets: AssetLibrary, status, road_entrances: Optional[list[float]] = None) -> None:
+        super().__init__(status)
+        self.location = location
+        self.settings = settings
+        self.config = config
+        self.assets = assets
+        self.rng = random.Random(settings.seed)
+        self.biome = location.metadata.get("biome", "plains")
+        if self.biome in WATER_BIOMES:
+            self.biome = "coast"
+        self.semantic = "fort"
+        self.road_entrances = _dedupe_angles_local(list(road_entrances or []))
+        self.image = make_biome_canvas(settings.width, settings.height, self.biome, settings.seed, 1.0)
+        self.draw = ImageDraw.Draw(self.image, "RGBA")
+
+    def generate(self) -> Generator[None, None, None]:
+        w, h = self.settings.width, self.settings.height
+        cx, cy = w * .52, h * .50
+        fw = min(w * .42, 500)
+        fh = min(h * .38, 360)
+        x1, y1, x2, y2 = cx-fw/2, cy-fh/2, cx+fw/2, cy+fh/2
+        wall = (92, 76, 58, 255)
+        fill = (122, 103, 78, 70)
+        self.draw.rectangle((x1,y1,x2,y2), fill=fill, outline=wall, width=13)
+        for tx,ty in ((x1,y1),(x2,y1),(x1,y2),(x2,y2)):
+            self.draw.rectangle((tx-13,ty-13,tx+13,ty+13), fill=(109,91,69,255), outline=(58,50,42,255), width=3)
+        entrances = self.road_entrances[:3]
+        gate_angle = entrances[0] if entrances else math.pi/2
+        gate = _ray_to_rect_border(cx, cy, gate_angle, (x1,y1,x2,y2))
+        self.draw.ellipse((gate[0]-14,gate[1]-14,gate[0]+14,gate[1]+14), fill=(177,129,73,255), outline=(60,48,38,255), width=3)
+        self._progress("Building compact defensive fort", .20)
+        yield
+        buildings = [
+            ("barracks", "Barracks", cx-85, cy-38, 120, 70),
+            ("blacksmith", "Armory & Forge", cx+76, cy-38, 92, 64),
+            ("stable", "Stable", cx-72, cy+70, 110, 60),
+            ("house", "Commander's Quarters", cx+78, cy+66, 92, 60),
+        ]
+        for i,(kind,name,x,y,bw,bh) in enumerate(buildings):
+            entity=Entity(str(uuid.uuid4()),"building",kind,name,x,y,bw,bh,metadata={"biome":self.biome,"building_type":kind,"floor_count":_building_floor_count(kind,bw,bh,self.rng),"location":self.location.name})
+            self.entities.append(entity)
+            _draw_topdown_building(self.image,entity,self.assets)
+            self._progress("Placing fort buildings", .30+.28*(i+1)/len(buildings))
+            yield
+        for i,angle in enumerate(entrances):
+            border=_ray_to_border(cx,cy,angle,w,h,3)
+            pts=_curved_connection(border,gate if i==0 else (cx,cy),self.rng,18,wobble=6)
+            self.paths.append({"id":str(uuid.uuid4()),"kind":"road","major":i==0,"entrance_angle":round(angle,6),"points":[[round(x,2),round(y,2)] for x,y in pts]})
+            self.draw.line(pts,fill=(86,65,47,190),width=16,joint="curve")
+            self.draw.line(pts,fill=(157,119,76,255),width=9,joint="curve")
+            yield
+        if self.config.npcs:
+            for _ in range(self.rng.randint(5,9)):
+                self.entities.append(Entity(str(uuid.uuid4()),"npc","guard","Guard",cx+self.rng.randint(-150,150),cy+self.rng.randint(-120,120),24,24,movable=True,metadata={"biome":self.biome}))
+        self.metadata.update({"biome_grid":[[self.biome for _ in range(45)] for _ in range(34)],"road_entrances":[round(a,6) for a in entrances],"fort_scale":"small"})
+        self._progress("Fort complete",1.0)
+        yield
+
+
+class BanditCampGenerator(SceneGenerator):
+    def __init__(self, location: Entity, settings: DetailSettings, config: GenerationConfig, assets: AssetLibrary, status, road_entrances: Optional[list[float]] = None) -> None:
+        super().__init__(status)
+        self.location=location; self.settings=settings; self.config=config; self.assets=assets
+        self.rng=random.Random(settings.seed)
+        self.biome=location.metadata.get("biome","plains")
+        if self.biome in WATER_BIOMES: self.biome="coast"
+        self.semantic="bandit_camp"
+        self.road_entrances=_dedupe_angles_local(list(road_entrances or []))
+        self.image=make_biome_canvas(settings.width,settings.height,self.biome,settings.seed,1.35)
+        self.draw=ImageDraw.Draw(self.image,"RGBA")
+
+    def generate(self)->Generator[None,None,None]:
+        w,h=self.settings.width,self.settings.height; cx,cy=w*.52,h*.50
+        radius=min(w,h)*.24
+        pal=[]
+        for i in range(24):
+            a=i/24*math.tau
+            rr=radius*self.rng.uniform(.82,1.08)
+            pal.append((cx+math.cos(a)*rr,cy+math.sin(a)*rr*.78))
+        pal.append(pal[0])
+        self.draw.line(pal,fill=(83,58,39,230),width=9,joint="curve")
+        self._progress("Raising rough palisade",.15); yield
+        self.draw.ellipse((cx-20,cy-14,cx+20,cy+14),fill=(61,53,43,220),outline=(40,35,31,255),width=2)
+        self.draw.polygon(((cx-8,cy+7),(cx,cy-16),(cx+9,cy+7)),fill=(224,126,48,240),outline=(116,58,30,240))
+        camp_size=str(self.location.metadata.get("camp_size") or self.rng.choice(["small","small","medium","large"]))
+        tent_count={"small":4,"medium":7,"large":11}.get(camp_size,6)
+        for i in range(tent_count):
+            a=self.rng.uniform(0,math.tau); r=self.rng.uniform(radius*.25,radius*.72)
+            x=cx+math.cos(a)*r; y=cy+math.sin(a)*r*.72
+            if camp_size=="large" and i in {0,1}:
+                kind="rough_hut"; bw,bh=62,44
+                self.draw.rectangle((x-bw/2,y-bh/2,x+bw/2,y+bh/2),fill=(132,103,68,255),outline=(65,48,35,255),width=3)
+                self.draw.polygon(((x-bw/2-4,y-bh/2),(x,y-bh/2-18),(x+bw/2+4,y-bh/2)),fill=(88,62,43,255),outline=(60,44,34,255))
+            else:
+                kind="tent"; bw,bh=48,38
+                self.draw.polygon(((x-bw/2,y+bh/2),(x,y-bh/2),(x+bw/2,y+bh/2)),fill=(145,124,91,245),outline=(62,49,38,255))
+                self.draw.line((x,y-bh/2,x,y+bh/2),fill=(90,68,45,210),width=2)
+            self.entities.append(Entity(str(uuid.uuid4()),"building",kind,"Bandit Tent" if kind=="tent" else "Rough Hut",x,y,bw,bh,metadata={"biome":self.biome,"building_type":"house","camp":self.location.name,"floor_count":1}))
+            if i%2==0: yield
+        for j,(sub,name,ox,oy) in enumerate([
+            ("loot","Loot Pile",-75,15),("weapon_rack","Weapon Rack",78,8),("prison","Prison Pen",58,86),("supplies","Supplies",-92,-62)
+        ]):
+            x,y=cx+ox,cy+oy
+            self.entities.append(Entity(str(uuid.uuid4()),"object",sub,name,x,y,34,28,movable=True,metadata={"biome":self.biome,"rotation":self.rng.choice([0,90,180,270])}))
+        entrances=self.road_entrances[:2]
+        for i,a in enumerate(entrances):
+            border=_ray_to_border(cx,cy,a,w,h,3)
+            pts=_curved_connection(border,(cx,cy),self.rng,16,wobble=9)
+            self.paths.append({"id":str(uuid.uuid4()),"kind":"trail","major":False,"entrance_angle":round(a,6),"points":[[round(x,2),round(y,2)] for x,y in pts]})
+            self.draw.line(pts,fill=(111,83,56,220),width=8,joint="curve")
+        if self.config.npcs:
+            count={"small":4,"medium":7,"large":11}.get(camp_size,6)
+            for _ in range(count):
+                self.entities.append(Entity(str(uuid.uuid4()),"npc","bandit","Bandit",cx+self.rng.randint(int(-radius*.65),int(radius*.65)),cy+self.rng.randint(int(-radius*.48),int(radius*.48)),24,24,movable=True,metadata={"biome":self.biome}))
+        self.metadata.update({"biome_grid":[[self.biome for _ in range(48)] for _ in range(34)],"camp_size":camp_size,"road_entrances":[round(a,6) for a in entrances]})
+        self._progress("Bandit camp complete",1.0); yield
+
+
+class DragonLairGenerator(SceneGenerator):
+    def __init__(self, location: Entity, settings: DetailSettings, config: GenerationConfig, assets: AssetLibrary, status, road_entrances: Optional[list[float]] = None) -> None:
+        super().__init__(status)
+        self.location=location; self.settings=settings; self.config=config; self.assets=assets
+        self.rng=random.Random(settings.seed); self.semantic="dragon_lair"; self.biome="mountain"
+        self.image=Image.new("RGB",(settings.width,settings.height),(42,39,36)); self.draw=ImageDraw.Draw(self.image,"RGBA")
+
+    def generate(self)->Generator[None,None,None]:
+        w,h=self.settings.width,self.settings.height; cx,cy=w*.55,h*.52
+        chambers=[(cx,cy,min(w,h)*.24),(cx-w*.23,cy+h*.05,min(w,h)*.15),(cx+w*.18,cy-h*.18,min(w,h)*.13)]
+        for i,(x,y,r) in enumerate(chambers):
+            self.draw.ellipse((x-r*1.35,y-r,x+r*1.35,y+r),fill=(65,59,53,255),outline=(28,27,26,255),width=10)
+            if i: self.draw.line((cx,cy,x,y),fill=(64,58,52,255),width=max(40,int(r*.55)))
+            yield
+        for _ in range(16):
+            x=cx+self.rng.randint(-int(w*.23),int(w*.23)); y=cy+self.rng.randint(-int(h*.21),int(h*.21))
+            self.draw.line((x-8,y,x+8,y),fill=(209,203,177,150),width=3)
+            self.draw.ellipse((x-3,y-3,x+3,y+3),outline=(209,203,177,150),width=1)
+        for _ in range(22):
+            x=cx+self.rng.randint(-90,100); y=cy+self.rng.randint(25,115)
+            self.draw.ellipse((x-4,y-3,x+4,y+3),fill=(216,168,53,230),outline=(126,89,34,180))
+        self.entities.append(Entity(str(uuid.uuid4()),"object","treasure","Dragon Hoard",cx+30,cy+90,110,70,movable=False,metadata={"biome":"underground"}))
+        dragon=Entity(str(uuid.uuid4()),"npc","dragon","Dragon",cx,cy-5,150,105,movable=True,metadata={"biome":"underground","large_creature":True,"tiles_w":3,"tiles_h":2})
+        self.entities.append(dragon)
+        if self.config.npcs:
+            for _ in range(self.rng.randint(2,5)):
+                self.entities.append(Entity(str(uuid.uuid4()),"npc","cave_creature",self.rng.choice(["Kobold","Drake","Cultist"]),cx+self.rng.randint(-220,220),cy+self.rng.randint(-160,180),24,24,movable=True,metadata={"biome":"underground"}))
+        self.metadata.update({"biome_grid":[["mountain" for _ in range(48)] for _ in range(34)],"terminal":True,"location_type":"dragon_lair","dragon_entity_id":dragon.id})
+        self._progress("Dragon lair complete",1.0); yield
+
+
+class DeepCaveGenerator(SceneGenerator):
+    def __init__(self, location: Entity, settings: DetailSettings, config: GenerationConfig, assets: AssetLibrary, status) -> None:
+        super().__init__(status)
+        self.location=location; self.settings=settings; self.config=config; self.assets=assets
+        self.rng=random.Random(settings.seed); self.semantic="cavern"; self.biome="mountain"
+        self.image=Image.new("RGB",(settings.width,settings.height),(40,39,37)); self.draw=ImageDraw.Draw(self.image,"RGBA")
+
+    def generate(self)->Generator[None,None,None]:
+        w,h=self.settings.width,self.settings.height
+        chambers=[]
+        for i in range(5):
+            x=self.rng.randint(int(w*.18),int(w*.82)); y=self.rng.randint(int(h*.18),int(h*.82)); rx=self.rng.randint(90,180); ry=self.rng.randint(70,145)
+            chambers.append((x,y,rx,ry))
+        for i,(x,y,rx,ry) in enumerate(chambers):
+            self.draw.ellipse((x-rx,y-ry,x+rx,y+ry),fill=(68,64,59,255),outline=(26,25,24,255),width=12)
+            if i:
+                px,py,_,_=chambers[i-1]; self.draw.line((px,py,x,y),fill=(66,62,57,255),width=60)
+            self._progress("Carving deep caverns",.10+.30*(i+1)/len(chambers)); yield
+        wx,wy,wrx,wry=chambers[-1]
+        self.draw.ellipse((wx-wrx*.75,wy-wry*.45,wx+wrx*.75,wy+wry*.45),fill=(48,92,112,220),outline=(79,128,145,240),width=3)
+        for _ in range(55):
+            x=self.rng.randint(20,w-20); y=self.rng.randint(20,h-20)
+            if self.rng.random()<.55:
+                self.draw.polygon(((x,y-12),(x-6,y+7),(x+6,y+7)),fill=(102,96,87,220),outline=(56,53,49,180))
+            else:
+                _draw_rock(self.image,x,y,self.rng.randint(3,8),self.assets)
+        rx,ry,_,_=chambers[1]
+        self.draw.rectangle((rx-55,ry-38,rx+55,ry+38),outline=(115,109,96,220),width=8)
+        self.draw.line((rx-55,ry,rx+55,ry),fill=(115,109,96,160),width=4)
+        self.entities.append(Entity(str(uuid.uuid4()),"object","treasure","Ancient Cache",rx+20,ry+20,42,30,movable=True,metadata={"biome":"underground"}))
+        if self.config.npcs:
+            creatures=[("Giant Spider",34),("Cave Lizard",30),("Goblin",24),("Underdark Beast",42)]
+            for _ in range(self.rng.randint(4,8)):
+                name,size=self.rng.choice(creatures); x,y,_,_=self.rng.choice(chambers)
+                self.entities.append(Entity(str(uuid.uuid4()),"npc","cave_creature",name,x+self.rng.randint(-55,55),y+self.rng.randint(-45,45),size,size,movable=True,metadata={"biome":"underground","large_creature":size>36}))
+        self.metadata.update({"biome_grid":[["mountain" for _ in range(48)] for _ in range(34)],"terminal":True,"location_type":"cavern"})
+        self._progress("Deep cave complete",1.0); yield
+
+
+class RuinedCityGenerator(SceneGenerator):
+    def __init__(self, location: Entity, settings: DetailSettings, config: GenerationConfig, assets: AssetLibrary, status, road_entrances: Optional[list[float]]=None) -> None:
+        super().__init__(status)
+        self.location=location; self.settings=settings; self.config=config; self.assets=assets
+        self.rng=random.Random(settings.seed); self.biome=location.metadata.get("biome","plains"); self.semantic="ruined_city"
+        self.image=make_biome_canvas(settings.width,settings.height,self.biome,settings.seed,1.15); self.draw=ImageDraw.Draw(self.image,"RGBA")
+        self.road_entrances=_dedupe_angles_local(list(road_entrances or []))
+
+    def generate(self)->Generator[None,None,None]:
+        w,h=self.settings.width,self.settings.height; cx,cy=w/2,h/2
+        entrances=self.road_entrances[:4]
+        for a in entrances:
+            border=_ray_to_border(cx,cy,a,w,h,3); pts=_curved_connection(border,(cx,cy),self.rng,18,wobble=12)
+            self.paths.append({"id":str(uuid.uuid4()),"kind":"road","major":True,"entrance_angle":round(a,6),"points":[[round(x,2),round(y,2)] for x,y in pts]})
+            for k in range(0,len(pts)-1,3):
+                self.draw.line(pts[k:k+2],fill=(113,88,61,170),width=12)
+        count=max(18,self.settings.structure_count)
+        for i in range(count):
+            x=self.rng.randint(70,w-70); y=self.rng.randint(70,h-70); bw=self.rng.randint(34,62); bh=self.rng.randint(28,52)
+            self.draw.rectangle((x-bw/2,y-bh/2,x+bw/2,y+bh/2),fill=(126,116,101,150),outline=(72,65,58,230),width=3)
+            if self.rng.random()<.7:
+                self.draw.polygon(((x-bw/2,y-bh/2),(x,y-bh*.9),(x+bw/2,y-bh/2)),fill=(78,67,58,160))
+            if self.rng.random()<.75:
+                self.draw.rectangle((x+self.rng.randint(-int(bw/3),int(bw/3)),y+self.rng.randint(-int(bh/3),int(bh/3)),x+bw/2+3,y+bh/2+3),fill=BIOME_COLORS.get(self.biome,BIOME_COLORS["plains"])+(210,))
+            self.entities.append(Entity(str(uuid.uuid4()),"building","ruined_house",f"Ruined Building {i+1}",x,y,bw,bh,metadata={"biome":self.biome,"building_type":"house","abandoned":True,"floor_count":1}))
+            if i%4==0: yield
+        for _ in range(45):
+            x=self.rng.randint(20,w-20); y=self.rng.randint(20,h-20); _draw_rock(self.image,x,y,self.rng.randint(2,6),self.assets)
+        self.metadata.update({"biome_grid":[[self.biome for _ in range(48)] for _ in range(34)],"location_type":"ruined_city","road_entrances":[round(a,6) for a in entrances]})
+        self._progress("Ruined settlement complete",1.0); yield
+
+
+class BuildingSectionGenerator(SceneGenerator):
+    def __init__(self, building: Entity, width: int, height: int, seed: int, config: GenerationConfig, assets: AssetLibrary, status) -> None:
+        super().__init__(status)
+        self.building=building; self.width=width; self.height=height; self.seed=seed; self.config=config; self.assets=assets
+        self.rng=random.Random(seed); self.biome=building.metadata.get("biome","plains"); self.semantic="building_section"
+        self.building_type=_normalize_building_type(building.metadata.get("building_type") or building.subtype)
+        self.floor_count=max(2,int(building.metadata.get("floor_count") or _building_floor_count(self.building_type,building.width,building.height,self.rng)))
+        self.image=make_biome_canvas(width,height,self.biome,seed+53,.6); self.draw=ImageDraw.Draw(self.image,"RGBA")
+
+    def generate(self)->Generator[None,None,None]:
+        w,h=self.width,self.height; margin_x=max(120,w//7); margin_y=max(70,h//10)
+        bw=w-2*margin_x; bh=h-2*margin_y
+        floor_h=bh/self.floor_count
+        wall=(72,62,54,255)
+        self.draw.rectangle((margin_x,margin_y,w-margin_x,h-margin_y),fill=(191,172,137,230),outline=wall,width=12)
+        stair_x=margin_x+bw*.78
+        for i in range(self.floor_count):
+            top=margin_y+(self.floor_count-1-i)*floor_h; bottom=top+floor_h
+            if i>0: self.draw.line((margin_x,top,w-margin_x,top),fill=wall,width=7)
+            self.draw.line((stair_x-45,bottom-18,stair_x+45,top+18),fill=(96,68,48,255),width=6)
+            floor=Entity(str(uuid.uuid4()),"floor","floor",f"Floor {i+1}",w/2,(top+bottom)/2,bw-28,max(35,floor_h-18),metadata={"biome":self.biome,"building_type":self.building_type,"floor_index":i+1,"floor_count":self.floor_count,"source_building_id":self.building.id,"original_width":self.building.width,"original_height":self.building.height,"entrance_angle":self.building.metadata.get("entrance_angle",math.pi/2),"floor":BUILDING_PROFILES.get(self.building_type,BUILDING_PROFILES["house"])["floor"]})
+            self.entities.append(floor)
+            self.draw.text((margin_x+18,(top+bottom)/2),f"Floor {i+1}",anchor="lm",fill=(50,42,35,255))
+            self._progress("Building floor section",.12+.66*(i+1)/self.floor_count); yield
+        self.metadata.update({"biome_grid":[[self.biome for _ in range(40)] for _ in range(30)],"building_type":self.building_type,"floor_count":self.floor_count,"persistent_geometry":{"width":self.building.width,"height":self.building.height,"entrance_angle":self.building.metadata.get("entrance_angle")}})
+        self._progress("Building section complete",1.0); yield
+
+
 class BuildingInteriorGenerator(SceneGenerator):
     def __init__(self, building: Entity, width: int, height: int, seed: int, config: GenerationConfig, assets: AssetLibrary, status) -> None:
         super().__init__(status)
-        self.building=building
-        self.width=width
-        self.height=height
-        self.seed=seed
-        self.config=config
-        self.assets=assets
-        self.rng=random.Random(seed)
-        self.biome=building.metadata.get("biome","plains")
-        self.semantic="building"
-        self.building_type=_normalize_building_type(building.metadata.get("building_type") or building.subtype)
-        self.profile=BUILDING_PROFILES.get(self.building_type,BUILDING_PROFILES["house"])
-        self.image=make_biome_canvas(width,height,self.biome,seed+40,.8)
-        self.draw=ImageDraw.Draw(self.image,"RGBA")
-        self.room_rects:list[tuple[int,int,int,int,str]]=[]
+        self.building = building
+        self.width = width
+        self.height = height
+        self.seed = seed
+        self.config = config
+        self.assets = assets
+        self.rng = random.Random(seed)
+        self.biome = building.metadata.get("biome", "plains")
+        self.semantic = "building"
+        self.building_type = _normalize_building_type(building.metadata.get("building_type") or building.subtype)
+        self.profile = BUILDING_PROFILES.get(self.building_type, BUILDING_PROFILES["house"])
+        self.image = make_biome_canvas(width, height, self.biome, seed + 40, .8)
+        self.draw = ImageDraw.Draw(self.image, "RGBA")
+        self.room_rects: list[tuple[int, int, int, int, str]] = []
+        self.doorways: list[tuple[str, int, int, int, int]] = []
 
-    def generate(self)->Generator[None,None,None]:
+    def generate(self) -> Generator[None, None, None]:
         yield from self._shell_and_rooms()
         yield from self._furnish()
-        self.metadata["biome_grid"]=[[self.biome for _ in range(40)] for _ in range(30)]
-        self.metadata["building_type"]=self.building_type
-        self._progress("Building interior complete",1.0)
+        self.metadata["biome_grid"] = [[self.biome for _ in range(40)] for _ in range(30)]
+        self.metadata["building_type"] = self.building_type
+        self.metadata["floor_index"] = int(self.building.metadata.get("floor_index", 1))
+        self.metadata["floor_count"] = int(self.building.metadata.get("floor_count", 1))
+        self.metadata["persistent_geometry"] = {
+            "source_width": float(self.building.metadata.get("original_width", self.building.width)),
+            "source_height": float(self.building.metadata.get("original_height", self.building.height)),
+            "entrance_angle": float(self.building.metadata.get("entrance_angle", math.pi / 2)),
+        }
+        self.metadata["layout_variant"] = self.seed % 9973
+        self.metadata["room_count"] = len(self.room_rects)
+        self._progress("Building interior complete", 1.0)
         yield
 
-    def _shell_and_rooms(self)->Generator[None,None,None]:
-        margin=max(65,min(self.width,self.height)//10)
-        x1,y1,x2,y2=margin,margin,self.width-margin,self.height-margin
-        wall=self.profile["wall"]
-        floor_kind=self.profile["floor"]
-        _fill_floor(self.image,(x1,y1,x2,y2),floor_kind,self.assets,self.seed)
-        self.draw.rectangle((x1,y1,x2,y2),outline=wall+(255,),width=14)
-        names=self.profile["rooms"][:]
-        room_count=max(2,min(len(names),6))
-        cols=2 if room_count<=4 else 3
-        rows=math.ceil(room_count/cols)
-        cell_w=(x2-x1)//cols
-        cell_h=(y2-y1)//rows
-        for i in range(room_count):
-            col=i%cols; row=i//cols
-            rx1=x1+col*cell_w
-            ry1=y1+row*cell_h
-            rx2=x2 if col==cols-1 else x1+(col+1)*cell_w
-            ry2=y2 if row==rows-1 else y1+(row+1)*cell_h
-            name=names[i]
+    def _room_count(self) -> int:
+        area = max(1.0, float(self.building.width) * float(self.building.height))
+        if self.building_type == "house":
+            if area < 2200:
+                return self.rng.randint(1, 2)
+            if area < 3800:
+                return self.rng.randint(2, 4)
+            return self.rng.randint(3, 5)
+        ranges = {
+            "farmhouse": (2, 5), "tavern": (4, 6), "blacksmith": (2, 4), "library": (3, 5),
+            "temple": (2, 4), "wizard_tower": (3, 5), "shop": (2, 4), "castle": (5, 6),
+        }
+        lo, hi = ranges.get(self.building_type, (2, min(5, len(self.profile["rooms"]))))
+        return self.rng.randint(lo, hi)
+
+    def _partition(self, rect: tuple[int, int, int, int], count: int) -> list[tuple[int, int, int, int]]:
+        rects = [rect]
+        min_span = max(95, min(self.width, self.height) // 8)
+        while len(rects) < count:
+            candidates = sorted(enumerate(rects), key=lambda item: (item[1][2]-item[1][0])*(item[1][3]-item[1][1]), reverse=True)
+            split_done = False
+            for idx, (x1, y1, x2, y2) in candidates:
+                w, h = x2-x1, y2-y1
+                vertical = w > h * 1.15 or (w > min_span * 2 and self.rng.random() < .55)
+                if vertical and w >= min_span * 2:
+                    cut = int(x1 + w * self.rng.uniform(.36, .64))
+                    a, b = (x1,y1,cut,y2), (cut,y1,x2,y2)
+                elif h >= min_span * 2:
+                    cut = int(y1 + h * self.rng.uniform(.36, .64))
+                    a, b = (x1,y1,x2,cut), (x1,cut,x2,y2)
+                elif w >= min_span * 2:
+                    cut = int(x1 + w * self.rng.uniform(.40, .60))
+                    a, b = (x1,y1,cut,y2), (cut,y1,x2,y2)
+                else:
+                    continue
+                rects.pop(idx)
+                rects.extend([a,b])
+                split_done = True
+                break
+            if not split_done:
+                break
+        return rects
+
+    @staticmethod
+    def _adjacent_door(a: tuple[int,int,int,int], b: tuple[int,int,int,int]) -> tuple[str,int,int,int,int] | None:
+        ax1,ay1,ax2,ay2=a; bx1,by1,bx2,by2=b
+        if abs(ax2-bx1) <= 1 or abs(bx2-ax1) <= 1:
+            x = ax2 if abs(ax2-bx1) <= 1 else ax1
+            lo, hi = max(ay1,by1), min(ay2,by2)
+            if hi-lo >= 50:
+                y=(lo+hi)//2
+                return ("v",x,y-14,x,y+14)
+        if abs(ay2-by1) <= 1 or abs(by2-ay1) <= 1:
+            y = ay2 if abs(ay2-by1) <= 1 else ay1
+            lo, hi = max(ax1,bx1), min(ax2,bx2)
+            if hi-lo >= 50:
+                x=(lo+hi)//2
+                return ("h",x-14,y,x+14,y)
+        return None
+
+    def _connected_doors(self, rects: list[tuple[int,int,int,int]]) -> list[tuple[str,int,int,int,int]]:
+        edges=[]
+        for i in range(len(rects)):
+            for j in range(i+1,len(rects)):
+                door=self._adjacent_door(rects[i],rects[j])
+                if door:
+                    edges.append((self.rng.random(),i,j,door))
+        parent=list(range(len(rects)))
+        def find(x):
+            while parent[x]!=x:
+                parent[x]=parent[parent[x]]; x=parent[x]
+            return x
+        doors=[]
+        for _,i,j,door in sorted(edges):
+            a,b=find(i),find(j)
+            if a==b: continue
+            parent[b]=a
+            doors.append(door)
+        return doors
+
+    def _shell_and_rooms(self) -> Generator[None, None, None]:
+        margin = max(60, min(self.width, self.height) // 11)
+        available_w = self.width - margin * 2
+        available_h = self.height - margin * 2
+        source_aspect = max(.65, min(1.75, float(self.building.width) / max(1.0, float(self.building.height))))
+        shell_w = min(available_w, int(available_h * source_aspect))
+        shell_h = min(available_h, int(shell_w / source_aspect))
+        shell_w = max(int(available_w * .62), shell_w)
+        shell_h = max(int(available_h * .62), shell_h)
+        x1 = (self.width - shell_w)//2; y1=(self.height-shell_h)//2
+        x2=x1+shell_w; y2=y1+shell_h
+        wall = self.profile["wall"]
+        floor_kind = self.profile["floor"]
+        _fill_floor(self.image, (x1,y1,x2,y2), floor_kind, self.assets, self.seed)
+        self.draw.rectangle((x1,y1,x2,y2), outline=wall+(255,), width=14)
+        count = self._room_count()
+        rects = self._partition((x1,y1,x2,y2), count)
+        names = list(self.profile["rooms"])
+        if self.building_type == "house":
+            essential = ["living room", "bedroom", "kitchen", "storage"]
+            names = essential + [n for n in names if n not in essential]
+        if len(names) < len(rects):
+            names += [f"room {i+1}" for i in range(len(rects)-len(names))]
+        if self.building_type != "house":
+            self.rng.shuffle(names)
+        names=names[:len(rects)]
+        for i,((rx1,ry1,rx2,ry2),name) in enumerate(zip(rects,names)):
             self.room_rects.append((rx1,ry1,rx2,ry2,name))
-            if col>0:
-                self.draw.line((rx1,ry1,rx1,ry2),fill=wall+(255,),width=9)
-            if row>0:
-                self.draw.line((rx1,ry1,rx2,ry1),fill=wall+(255,),width=9)
+            self.draw.rectangle((rx1,ry1,rx2,ry2), outline=wall+(255,), width=7)
             cx=(rx1+rx2)//2; cy=(ry1+ry2)//2
-            self.entities.append(Entity(str(uuid.uuid4()),"room",name.replace(" ","_"),name.title(),cx,cy,rx2-rx1-12,ry2-ry1-12,metadata={"bounds":[rx1,ry1,rx2,ry2],"building_type":self.building_type,"biome":self.biome,"floor":floor_kind}))
-            self._progress("Creating connected rooms",.08+.30*(i+1)/room_count)
+            self.entities.append(Entity(str(uuid.uuid4()),"room",name.replace(" ","_"),name.title(),cx,cy,max(20,rx2-rx1-14),max(20,ry2-ry1-14),metadata={"bounds":[rx1,ry1,rx2,ry2],"building_type":self.building_type,"biome":self.biome,"floor":floor_kind}))
+            self._progress("Creating varied connected rooms", .08 + .30*(i+1)/max(1,len(rects)))
             yield
-        for i,room in enumerate(self.room_rects):
-            rx1,ry1,rx2,ry2,_=room
-            if i%cols!=cols-1 and i+1<room_count:
-                y=(ry1+ry2)//2
-                self.draw.rectangle((rx2-5,y-14,rx2+5,y+14),fill=(185,133,75,255))
-            if i+cols<room_count:
-                x=(rx1+rx2)//2
-                self.draw.rectangle((x-14,ry2-5,x+14,ry2+5),fill=(185,133,75,255))
-        entrance_x=(x1+x2)//2
-        self.draw.rectangle((entrance_x-18,y2-8,entrance_x+18,y2+8),fill=(178,124,69,255))
+        self.doorways = self._connected_doors(rects)
+        for orientation,dx1,dy1,dx2,dy2 in self.doorways:
+            if orientation == "v":
+                self.draw.rectangle((dx1-6,dy1,dx2+6,dy2), fill=(185,133,75,255))
+            else:
+                self.draw.rectangle((dx1,dy1-6,dx2,dy2+6), fill=(185,133,75,255))
+        entrance_angle = float(self.building.metadata.get("entrance_angle", math.pi / 2))
+        door = _ray_rect_intersection((x1+x2)/2, (y1+y2)/2, entrance_angle, (x1,y1,x2,y2))
+        if door is None:
+            door = ((x1+x2)/2, y2)
+        ex, ey = door
+        if abs(ex-x1) < 3 or abs(ex-x2) < 3:
+            self.draw.rectangle((ex-8,ey-20,ex+8,ey+20),fill=(178,124,69,255))
+        else:
+            self.draw.rectangle((ex-20,ey-8,ex+20,ey+8),fill=(178,124,69,255))
+        self.metadata["entrance"] = [round(ex,2), round(ey,2)]
+        self.metadata["entrance_angle"] = round(entrance_angle, 6)
         yield
 
-    def _furnish(self)->Generator[None,None,None]:
+    def _furnish(self) -> Generator[None, None, None]:
         if not self.config.furniture:
             return
         for i,(x1,y1,x2,y2,name) in enumerate(self.room_rects):
-            _furnish_room(self.image,(x1+14,y1+14,x2-14,y2-14),name,self.building_type,self.rng,self.assets)
-            self._progress(f"Furnishing {name}",.45+.48*(i+1)/len(self.room_rects))
+            specs = _furniture_specs((x1+18,y1+18,x2-18,y2-18), name, self.building_type, self.rng, detail=False)
+            for subtype, label, x, y, fw, fh, rotation in specs:
+                self.entities.append(Entity(
+                    str(uuid.uuid4()), "object", subtype, label, x, y, fw, fh,
+                    movable=True,
+                    metadata={
+                        "biome": self.biome,
+                        "building_type": self.building_type,
+                        "room": name,
+                        "rotation": rotation,
+                        "asset_slot": _furniture_asset_slot(subtype),
+                    },
+                ))
+            self._progress(f"Furnishing {name}", .45 + .48*(i+1)/max(1,len(self.room_rects)))
             yield
 
 
@@ -1157,7 +1602,24 @@ class RoomGenerator(SceneGenerator):
         self._progress("Expanding room",.25)
         yield
         if self.config.furniture:
-            _furnish_room(self.image,(35,35,self.width-35,self.height-35),self.room.name.lower(),self.room.metadata.get("building_type","house"),self.rng,self.assets,detail=True)
+            for subtype, label, x, y, fw, fh, rotation in _furniture_specs(
+                (42,42,self.width-42,self.height-42),
+                self.room.name.lower(),
+                self.room.metadata.get("building_type","house"),
+                self.rng,
+                detail=True,
+            ):
+                self.entities.append(Entity(
+                    str(uuid.uuid4()), "object", subtype, label, x, y, fw, fh,
+                    movable=True,
+                    metadata={
+                        "biome": self.biome,
+                        "building_type": self.room.metadata.get("building_type","house"),
+                        "room": self.room.name,
+                        "rotation": rotation,
+                        "asset_slot": _furniture_asset_slot(subtype),
+                    },
+                ))
         self._progress("Room detail complete",1.0)
         yield
 
@@ -1263,6 +1725,11 @@ def _ray_rect_intersection(cx: float, cy: float, angle: float, rect: tuple[float
     return x, y
 
 
+
+
+def _ray_to_rect_border(cx: float, cy: float, angle: float, rect: tuple[float, float, float, float]) -> tuple[float, float]:
+    hit = _ray_rect_intersection(cx, cy, angle, rect)
+    return hit if hit is not None else ((rect[0] + rect[2]) / 2, rect[3])
 def _curved_connection(a: tuple[float, float], b: tuple[float, float], rng: random.Random, steps: int = 16, wobble: float = 10) -> list[tuple[float, float]]:
     ax, ay = a
     bx, by = b
@@ -1315,9 +1782,18 @@ def _draw_location_marker(image: Image.Image, x: float, y: float, kind: str, nam
             d.ellipse((x-14*scale, y-17*scale, x+14*scale, y+18*scale), fill=(139, 132, 125, 255), outline=ink, width=3)
             d.polygon(((x-18*scale, y-13*scale), (x, y-34*scale), (x+18*scale, y-13*scale)), fill=(92, 72, 112, 255), outline=ink)
             d.ellipse((x-4*scale, y-3*scale, x+4*scale, y+5*scale), fill=(111, 175, 205, 230))
-    elif kind in {"cave", "dungeon_entrance", "mine"}:
+    elif kind in {"cave", "dungeon_entrance", "mine", "dragon_lair"}:
         d.arc((x-22*scale, y-15*scale, x+22*scale, y+20*scale), 180, 360, fill=(55, 50, 45, 255), width=max(4, int(7*scale)))
         d.ellipse((x-13*scale, y-1*scale, x+13*scale, y+14*scale), fill=(31, 30, 28, 255))
+        if kind == "dragon_lair":
+            d.polygon(((x-11*scale,y+2*scale),(x,y-9*scale),(x+11*scale,y+2*scale),(x+5*scale,y+11*scale),(x,y+5*scale),(x-5*scale,y+11*scale)),fill=(122,61,46,235),outline=ink)
+    elif kind == "bandit_camp":
+        d.polygon(((x-20*scale,y+13*scale),(x,y-18*scale),(x+20*scale,y+13*scale)),fill=(145,124,91,245),outline=ink)
+        d.line((x-23*scale,y+16*scale,x+23*scale,y+16*scale),fill=(82,57,39,230),width=max(2,int(4*scale)))
+    elif kind == "ruined_city":
+        d.rectangle((x-18*scale,y-13*scale,x-4*scale,y+15*scale),fill=(124,116,105,220),outline=ink,width=2)
+        d.rectangle((x+2*scale,y-7*scale,x+17*scale,y+15*scale),fill=(112,104,95,210),outline=ink,width=2)
+        d.line((x-24*scale,y+16*scale,x+24*scale,y+16*scale),fill=ink,width=3)
     elif kind in {"ruin", "temple"}:
         d.rectangle((x-16*scale, y-14*scale, x-8*scale, y+15*scale), fill=(126, 123, 113, 240))
         d.rectangle((x+3*scale, y-20*scale, x+13*scale, y+13*scale), fill=(126, 123, 113, 240))
@@ -1352,13 +1828,29 @@ def _building_name(kind:str,rng:random.Random)->str:
         "house":["Cottage","Town House","Home"],"tavern":["The Copper Mug","The Sleeping Griffin","The Lantern Inn"],
         "blacksmith":["Ironworks","Blacksmith","Forge"],"shop":["General Store","Market Shop","Provisioner"],
         "temple":["Temple","Chapel","Shrine"],"castle":["Keep","Castle","Citadel"],"farmhouse":["Farmhouse","Homestead"],
-        "library":["Library","Archive"],"wizard_tower":["Wizard Tower","Arcane Spire"]}
+        "library":["Library","Archive"],"wizard_tower":["Wizard Tower","Arcane Spire"],
+        "apothecary":["Apothecary","Herbalist"],"bakery":["Bakery","Bakehouse"],"stable":["Stable","Livery"],
+        "guild_hall":["Guild Hall","Company Hall"],"warehouse":["Warehouse","Storehouse"],"government":["Council Hall","Magistrate"],
+        "noble_house":["Noble House","Manor"],"mage_shop":["Arcane Shop","Enchanter"]}
     return rng.choice(names.get(kind,[kind.replace("_"," ").title()]))
 
 
 def _normalize_building_type(kind:str)->str:
-    mapping={"inn":"tavern","fort":"castle","farm":"farmhouse","windmill":"farmhouse","desert_temple":"temple","witch_hut":"wizard_tower","ocean_monument":"castle"}
+    mapping={"inn":"tavern","fort":"castle","farm":"farmhouse","windmill":"farmhouse","desert_temple":"temple","witch_hut":"wizard_tower","ocean_monument":"castle","rough_hut":"house","tent":"house","ruined_house":"house"}
     return mapping.get(kind,kind if kind in BUILDING_PROFILES else "house")
+
+
+def _building_floor_count(kind: str, width: float, height: float, rng: random.Random) -> int:
+    area = max(1.0, width * height)
+    if kind in {"wizard_tower", "castle"}:
+        return rng.randint(4, 6) if kind == "wizard_tower" else rng.randint(3, 5)
+    if kind in {"government", "guild_hall", "noble_house", "tavern"}:
+        return 2 if area < 5000 else rng.randint(2, 3)
+    if kind in {"warehouse", "stable", "blacksmith", "shop", "apothecary", "bakery"}:
+        return 1 if area < 5000 else 2
+    if kind == "house":
+        return 1 if area < 3400 else (2 if rng.random() < .55 else 1)
+    return 1
 
 
 def _paste_asset(image:Image.Image,asset:Image.Image|None,x:float,y:float,w:int,h:int)->bool:
@@ -1489,52 +1981,125 @@ def _fill_floor(image:Image.Image,rect:tuple[int,int,int,int],kind:str,assets:As
             for x in range(x1+rng.randint(0,40),x2,step):d.line((x,y,x,min(y2,y+plank)),fill=(90,65,44,90),width=1)
 
 
-def _furnish_room(image:Image.Image,rect:tuple[int,int,int,int],room_name:str,building_type:str,rng:random.Random,assets:AssetLibrary,detail:bool=False)->None:
-    x1,y1,x2,y2=rect;d=ImageDraw.Draw(image,"RGBA");w=x2-x1;h=y2-y1
-    def table(x,y,scale=1):
-        asset=assets.get_slot("furniture.table")
-        if _paste_asset(image,asset,x,y,int(50*scale),int(34*scale)):return
-        d.rectangle((x-20*scale,y-10*scale,x+20*scale,y+10*scale),fill=(105,73,45,255),outline=(57,43,33,255),width=2)
-    def chair(x,y):
-        asset=assets.get_slot("furniture.chair")
-        if _paste_asset(image,asset,x,y,20,20):return
-        d.rectangle((x-5,y-5,x+5,y+5),fill=(84,61,43,255))
-    def bed(x,y):
-        asset=assets.get_slot("furniture.bed")
-        if _paste_asset(image,asset,x,y,52,78):return
-        d.rectangle((x-22,y-34,x+22,y+34),fill=(117,83,59,255),outline=(55,43,35,255),width=2);d.rectangle((x-18,y-29,x+18,y-17),fill=(205,197,170,255));d.rectangle((x-18,y-14,x+18,y+29),fill=(154,116,105,255))
-    cx=(x1+x2)//2;cy=(y1+y2)//2;name=room_name.lower()
-    if any(k in name for k in ["common","living","sales","great hall"]):
-        for ox,oy in [(-w*.22,-h*.12),(w*.18,h*.12)]:
-            table(cx+ox,cy+oy);chair(cx+ox-28,cy+oy);chair(cx+ox+28,cy+oy)
-        if "sales" in name:d.rectangle((x2-35,y1+12,x2-18,y2-12),fill=(98,69,46,255))
-    elif "bar" in name:
-        d.rectangle((x1+18,y1+18,x2-18,y1+40),fill=(101,69,44,255));
-        for x in range(x1+28,x2-25,26):chair(x,y1+55)
-        for x in range(x1+22,x2-20,24):d.ellipse((x-7,y2-24,x+7,y2-10),fill=(117,75,42,255),outline=(61,45,34,255))
+
+def _furniture_asset_slot(subtype: str) -> str | None:
+    return {
+        "table": "furniture.table",
+        "chair": "furniture.chair",
+        "bed": "furniture.bed",
+        "chest": "furniture.chest",
+        "shelf": "furniture.shelf",
+        "wardrobe": "furniture.wardrobe",
+        "lamp": "furniture.lamp",
+        "desk": "furniture.desk",
+        "cabinet": "furniture.cabinet",
+        "rug": "furniture.rug",
+        "fireplace": "furniture.fireplace",
+        "barrel": "object.barrel",
+        "crate": "object.crate",
+        "plant": "object.plant",
+        "weapon_rack": "object.weapon_rack",
+    }.get(subtype)
+
+
+def _furniture_specs(
+    rect: tuple[int, int, int, int],
+    room_name: str,
+    building_type: str,
+    rng: random.Random,
+    detail: bool = False,
+) -> list[tuple[str, str, float, float, float, float, int]]:
+    x1,y1,x2,y2=rect
+    if x2-x1 < 50 or y2-y1 < 50:
+        return []
+    cx=(x1+x2)/2; cy=(y1+y2)/2
+    name=room_name.lower()
+    out: list[tuple[str,str,float,float,float,float,int]]=[]
+
+    def add(kind: str, label: str, x: float, y: float, w: float, h: float, rotation: int | None = None) -> None:
+        rot = rng.choice([0,90,180,270]) if rotation is None else rotation
+        margin=max(w,h)/2+5
+        x=max(x1+margin,min(x2-margin,x)); y=max(y1+margin,min(y2-margin,y))
+        out.append((kind,label,x,y,w,h,rot))
+
+    def table_set(x: float, y: float, scale: float=1.0) -> None:
+        rot=rng.choice([0,90])
+        tw,th=(58*scale,34*scale) if rot==0 else (34*scale,58*scale)
+        add("table","Table",x,y,tw,th,rot)
+        offsets=[(-tw/2-15,0),(tw/2+15,0)] if rot==0 else [(0,-th/2-15),(0,th/2+15)]
+        if rng.random()<.7: offsets += ([(0,-th/2-15),(0,th/2+15)] if rot==0 else [(-tw/2-15,0),(tw/2+15,0)])
+        for ox,oy in offsets:
+            add("chair","Chair",x+ox,y+oy,20,20,(rot+90)%180)
+
+    if any(k in name for k in ["living","common","great hall","meeting"]):
+        table_set(cx+rng.uniform(-30,30),cy+rng.uniform(-20,20),1.0 if not detail else 1.15)
+        if rng.random()<.8: add("rug","Rug",cx,cy+45,90,55,rng.choice([0,90]))
+        if rng.random()<.65: add("fireplace","Fireplace",x1+30,cy,35,58,90)
+        if rng.random()<.55: add("chest","Chest",x2-38,y2-30,36,24,0)
     elif any(k in name for k in ["bedroom","bedchamber","guest room"]):
-        bed(x1+45,cy);d.rectangle((x2-45,y1+25,x2-15,y1+50),fill=(104,74,47,255));d.rectangle((x2-45,y2-50,x2-15,y2-20),fill=(116,82,48,255))
-    elif any(k in name for k in ["kitchen","pantry"]):
-        d.rectangle((x1+15,y1+15,x1+45,y2-15),fill=(108,78,50,255));d.ellipse((x2-58,cy-22,x2-18,cy+18),fill=(83,77,67,255),outline=(49,45,41,255),width=3);table(cx,cy)
-    elif "forge" in name or "workshop" in name:
-        d.rectangle((x1+18,cy-18,x1+68,cy+18),fill=(83,77,68,255),outline=(50,47,43,255),width=3);d.polygon(((cx-12,cy+8),(cx+12,cy+8),(cx+6,cy-4),(cx-6,cy-4)),fill=(69,68,66,255));d.rectangle((x2-45,y1+16,x2-18,y2-16),fill=(102,72,44,255))
+        add("bed","Bed",x1+48,cy,52,78,rng.choice([0,180]))
+        add("wardrobe","Wardrobe",x2-34,y1+38,40,58,rng.choice([0,90]))
+        if rng.random()<.75: add("chest","Chest",x2-40,y2-32,38,24,0)
+        if rng.random()<.6: add("lamp","Lamp",x1+82,y1+32,18,18,0)
+    elif any(k in name for k in ["kitchen","pantry","bakery"]):
+        add("cabinet","Cabinet",x1+30,cy,34,70,90)
+        table_set(cx,cy,0.85)
+        if rng.random()<.8: add("barrel","Barrel",x2-30,y2-30,28,28,0)
+        if building_type in {"bakery","tavern"}: add("fireplace","Oven",x2-32,y1+38,38,52,90)
+    elif any(k in name for k in ["storage","loading","tack"]):
+        for _ in range(rng.randint(4,8 if detail else 6)):
+            kind=rng.choice(["crate","barrel","chest"])
+            add(kind,kind.title(),rng.uniform(x1+25,x2-25),rng.uniform(y1+25,y2-25),rng.choice([26,32,38]),rng.choice([24,28,34]))
+    elif any(k in name for k in ["forge","workshop","armory","barracks"]):
+        add("table","Workbench",cx,cy,70,32,rng.choice([0,90]))
+        add("weapon_rack","Weapon Rack",x2-28,cy,30,70,90)
+        if "barracks" in name:
+            add("bed","Bunk",x1+40,y1+48,45,68,0); add("bed","Bunk",x1+40,y2-48,45,68,0)
+        else:
+            add("anvil","Anvil",x1+42,cy,36,30,rng.choice([0,90]))
+            add("forge","Forge",x2-42,y1+42,54,46,0)
     elif any(k in name for k in ["library","stacks","archive","study","reading"]):
-        for x in range(x1+18,x2-20,36):d.rectangle((x,y1+12,x+18,y2-12),fill=(92,65,42,255));table(cx,cy);chair(cx,cy+26)
+        shelf_count=max(2,min(6,int((x2-x1)/85)))
+        for i in range(shelf_count):
+            x=x1+28+i*(x2-x1-56)/max(1,shelf_count-1)
+            add("shelf","Bookshelf",x,y1+30,26,60,0)
+        add("desk","Desk",cx,y2-44,58,34,rng.choice([0,180]))
+        add("chair","Chair",cx,y2-78,20,20,0)
     elif any(k in name for k in ["sanctuary","chapel"]):
-        for y in range(y1+28,y2-45,36):d.rectangle((x1+35,y,x2-35,y+10),fill=(103,76,51,255));d.rectangle((cx-30,y1+12,cx+30,y1+30),fill=(177,164,132,255))
+        rows=max(2,min(5,int((y2-y1)/75)))
+        for i in range(rows):
+            add("bench","Pew",cx,y1+45+i*55,max(80,(x2-x1)*.64),20,0)
+        add("altar","Altar",cx,y2-38,76,32,0)
     elif any(k in name for k in ["alchemy","ritual"]):
-        table(cx,cy)
-        for _ in range(8):
-            x=rng.randint(x1+20,x2-20);y=rng.randint(y1+20,y2-20);d.ellipse((x-5,y-5,x+5,y+5),fill=rng.choice([(92,142,111,230),(145,92,159,230),(177,130,62,230)]),outline=(53,45,39,255))
-        if "ritual" in name:d.ellipse((cx-45,cy-45,cx+45,cy+45),outline=(119,76,131,190),width=3)
-    elif "storage" in name:
-        for _ in range(7 if detail else 4):
-            x=rng.randint(x1+18,x2-18);y=rng.randint(y1+18,y2-18);d.rectangle((x-11,y-8,x+11,y+8),fill=(113,78,44,255),outline=(62,44,32,255))
+        table_set(cx,cy,.9)
+        add("shelf","Potion Shelf",x2-26,cy,28,72,90)
+        for _ in range(rng.randint(2,5)):
+            add("plant","Herb Pot",rng.uniform(x1+25,x2-25),rng.uniform(y1+25,y2-25),18,18,0)
+        if "ritual" in name: add("rug","Ritual Circle",cx,cy,96,96,0)
+    elif any(k in name for k in ["sales","counter","shop"]):
+        add("counter","Counter",cx,y1+36,max(85,(x2-x1)*.62),30,0)
+        add("shelf","Shelf",x2-27,cy,28,max(70,(y2-y1)*.55),90)
+        if building_type in {"apothecary","mage_shop"}:
+            add("cabinet","Display Cabinet",x1+28,cy,30,70,90)
+    elif "stable" in name:
+        stalls=max(2,min(5,int((x2-x1)/75)))
+        for i in range(stalls):
+            add("stall","Horse Stall",x1+42+i*65,cy,48,80,0)
+        add("barrel","Water Barrel",x2-28,y2-28,28,28,0)
     else:
-        table(cx,cy);chair(cx-30,cy);chair(cx+30,cy)
-    if detail and w>180 and h>140:
-        bx=x2-70;by=y2-60
-        d.rectangle((bx-22,by-22,bx+22,by+22),fill=(122,86,52,255),outline=(57,43,33,255),width=2)
-        for i in range(1,8):
-            p=bx-22+i*44/8;d.line((p,by-22,p,by+22),fill=(55,45,38,100),width=1);d.line((bx-22,by-22+i*44/8,bx+22,by-22+i*44/8),fill=(55,45,38,100),width=1)
-        d.text((bx,by),"♟",anchor="mm",fill=(42,36,32,255))
+        table_set(cx,cy,.85)
+        if rng.random()<.55: add("cabinet","Cabinet",x2-28,y1+35,30,58,90)
+        if rng.random()<.45: add("plant","Plant",x1+26,y2-28,20,20,0)
+
+    if building_type == "wizard_tower" and rng.random()<.65:
+        add("lamp","Arcane Lamp",x2-28,y2-28,20,20,0)
+    if building_type == "tavern" and rng.random()<.7:
+        add("barrel","Ale Barrel",x1+28,y2-28,30,30,0)
+    if building_type == "blacksmith" and rng.random()<.7:
+        add("crate","Metal Stock",x1+28,y2-28,34,28,0)
+    if building_type == "temple" and rng.random()<.55:
+        add("statue","Statue",x1+30,y1+34,28,45,0)
+
+    if detail and (x2-x1)>180 and (y2-y1)>140 and rng.random()<.55:
+        add("chess","Chess Board",x2-62,y2-55,42,42,rng.choice([0,90]))
+    return out

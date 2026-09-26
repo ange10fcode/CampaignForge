@@ -19,9 +19,10 @@ BIOME_COLORS = {
     "mountain": (111, 105, 94),
     "snow": (220, 221, 211),
     "desert": (204, 183, 111),
+    "wetlands": (94, 132, 92),
 }
 
-LAND_BIOMES = {"coast", "plains", "dry_plains", "forest", "dark_forest", "hills", "mountain", "snow", "desert"}
+LAND_BIOMES = {"coast", "plains", "dry_plains", "forest", "dark_forest", "hills", "mountain", "snow", "desert", "wetlands"}
 WATER_BIOMES = {"ocean", "deep_ocean"}
 
 STRUCTURE_BIOMES = {
@@ -31,9 +32,12 @@ STRUCTURE_BIOMES = {
     "inn": LAND_BIOMES - {"mountain", "snow"},
     "temple": LAND_BIOMES,
     "wizard_tower": LAND_BIOMES - {"ocean", "deep_ocean"},
-    "witch_hut": {"forest", "dark_forest", "swamp"},
+    "witch_hut": {"forest", "dark_forest", "wetlands"},
     "ruin": LAND_BIOMES,
     "fort": {"plains", "dry_plains", "hills", "mountain", "coast"},
+    "bandit_camp": {"plains", "dry_plains", "forest", "dark_forest", "hills", "desert"},
+    "dragon_lair": {"hills", "mountain", "forest", "dark_forest", "snow"},
+    "ruined_city": {"plains", "dry_plains", "forest", "hills", "desert"},
     "cave": {"hills", "mountain", "forest", "dark_forest"},
     "dungeon_entrance": {"plains", "dry_plains", "forest", "dark_forest", "hills", "mountain", "desert"},
     "mine": {"hills", "mountain", "forest", "dark_forest"},
@@ -101,6 +105,13 @@ def draw_biome_texture(image: Image.Image, biome: str, seed: int, density: float
         for _ in range(count):
             x, y = rng.randrange(w), rng.randrange(h)
             d.ellipse((x, y, x+2, y+1), fill=(112, 94, 59, rng.randint(20, 70)))
+    elif biome == "wetlands":
+        for _ in range(count):
+            x, y = rng.randrange(w), rng.randrange(h)
+            r = rng.choice((1, 2, 3))
+            d.ellipse((x-r, y-r, x+r, y+r), fill=(42, 83, 61, rng.randint(20, 70)))
+            if rng.random() < .18:
+                d.line((x, y+3, x, y-4), fill=(54, 88, 49, 90), width=1)
     elif biome in {"mountain", "snow", "hills"}:
         for _ in range(count):
             x, y = rng.randrange(w), rng.randrange(h)

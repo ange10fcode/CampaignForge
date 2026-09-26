@@ -1,231 +1,145 @@
-# CampaignForge 1.0
+# CampaignForge 1.1.0
 
-CampaignForge is a context-aware procedural world builder and map editor for tabletop campaigns. It is designed around one persistent world rather than a collection of unrelated random maps.
+CampaignForge is a portable Python desktop world builder and tabletop map editor. It keeps one persistent campaign world and reveals more detail as you move from the world map into regions, settlements, buildings, floors, rooms, and objects.
 
-The navigation model is:
+The core hierarchy is:
 
-**World → Region / Terrain → Town / Castle / Cave / Mage Tower → Building → Room**
+**World → Region/Biome → Settlement/Special Location → Building → Floor → Room → Furniture/Object**
 
-Generation at every level inherits location identity, biome, major roads, relative position, and existing generated content from its parent.
+The important rule in 1.1.0 is continuity: zooming should reveal the same place at a finer level of detail rather than generating an unrelated replacement.
 
+## 1.1.0 highlights
 
-### Multi-location selections
+### Persistent zoom geometry and roads
 
-Selecting an area that contains several cities or major locations now creates an area-level map containing **all of them**. It no longer picks one settlement and turns the entire selection into that settlement's detailed view.
+- Parent road entrances are inherited by detailed settlement views.
+- A town with two major incoming roads receives two major incoming roads in its detailed scene.
+- Local streets may exist inside the settlement without inventing extra external connections.
+- Buildings retain source dimensions, orientation metadata, and road-facing entrance direction.
+- Multi-floor buildings retain floor count and source geometry.
+- Previously generated scenes remain linked and are reused instead of regenerated.
+- Extreme area selections are normalized to a usable aspect ratio without stretching the parent terrain image.
 
-The child map preserves:
+### Geography-aware world roads
 
-- every selected city/locations
-- each location's type
-- relative position and distance
-- inherited roads and trails
-- biome layout
-- links to already-generated child scenes
+The world road graph is optional rather than universally connected.
 
-A town, village, castle, cave, and mage tower can therefore coexist in one regional detail map at the appropriate simplified LOD.
+- villages have fewer possible connections than major settlements
+- distant settlement pairs are normally rejected
+- castles receive a modest access preference
+- terrain-aware A* routing avoids open water and heavily penalizes steep/mountainous terrain
+- isolated settlements are allowed
+- road minimum, maximum, and connection probability remain configurable
 
-![Multi-location LOD](screenshots/multi_city_lod.png)
+### Distinct special locations
 
-### Stable roads between zoom levels
+Dedicated generators now exist for:
 
-Major road identity is carried through the hierarchy. Roads store endpoint/location references, are clipped into selected detail areas, and are transformed into child coordinates instead of being invented again.
+- castles
+- compact forts
+- mage towers
+- bandit camps
+- caves and terminal deep caverns
+- dragon lairs
+- ruined settlements
+- ocean locations
 
-When entering a town or castle, the detailed generator reads the directions of the roads that actually connect to that location. Those roads become the entrances to the detailed map. A town with two inherited regional roads therefore receives two major entrances instead of six random spokes from its center.
+Bandit camps use tents, rough huts, palisades, supplies, loot, and bandits rather than the city-house generator. Dragon lairs use cavern/ruin environments and include a large multi-cell dragon. Deep caves are terminal locations, preventing cave → cave → cave recursion.
 
-### Proper major location types
+![Bandit camp](screenshots/bandit_camp.png)
 
-CampaignForge now treats these as first-class explorable locations:
+![Dragon lair](screenshots/dragon_lair.png)
 
-- towns and villages
-- castles and forts
-- caves, mines, and dungeon entrances
-- mage/wizard towers
+### Better settlements and wilderness
 
-Castles have gates and inherited road approaches, mage towers use appropriate grounds and paths, and caves use trails and rocky/underground context.
+Cities and towns can contain a wider mix of buildings, including taverns, blacksmiths, shops, apothecaries, bakeries, stables, guild halls, warehouses, mage shops, temples, libraries, and noble houses.
 
-![Castle detail](screenshots/castle.png)
+Wilderness generation was reduced so ordinary plains and forests remain mostly wilderness. Houses and points of interest are discoveries rather than automatic filler.
 
-### Generated sub-area deletion
+### Better interiors
 
-The Campaign tab contains **Delete Selected Sub-Area**. It deletes only the selected generated scene and its generated descendants. The parent world/region and unrelated branches are kept, and any links to the deleted branch are safely cleared.
+Interiors now use a persistent building footprint with exterior biome outside the walls.
 
-### Asset editing and transforms
+- variable connected room layouts
+- source building aspect ratio is preserved
+- doors face the inherited parent entrance when possible
+- different building profiles use different rooms, flooring, and furniture pools
+- furniture is represented as persistent movable objects
+- tables, chairs, beds, wardrobes, chests, shelves, lamps, desks, cabinets, rugs, fireplaces, barrels, crates, plants, workbenches, weapon racks, anvils, forges, pews, altars, counters, stalls, statues, and chess boards are supported
+- object rotation is visible and objects can be moved with the same transform workflow as characters/custom PNGs
 
-Imported PNGs can now be:
+Large buildings can generate a floor-section scene. Selecting a floor enters that floor while preserving the parent building identity and floor count.
 
-- renamed
-- intentionally pixelated from the original source
-- restored to the original unpixelated image
-- moved
-- scaled larger/smaller
-- resized to exact dimensions
-- freely stretched when aspect locking is disabled
-- rotated in 15-degree increments
-- flipped horizontally or vertically
-- reset to the original placed transform
+### Climate and terrain
 
-The same Transform panel is used for movable NPCs and placed PNG objects instead of putting resize controls inside the NPC tool.
+World terrain continues to use interacting:
 
-### Rendering and performance
+- Temperature
+- Maximum Altitude
+- Moisture
 
-The editor now uses several lightweight rendering optimizations:
+Rivers are terrain/moisture driven when automatic generation is enabled. River paths generally start high and descend toward lower terrain. Mountains are communicated by terrain shading/elevation rather than redundant mountain glyph spam.
 
-- cached grid/base images
-- cached scaled map previews
-- fast bilinear rendering while actively zooming/dragging
-- deferred high-quality Lanczos rendering after interaction stops
-- throttled object-drag redraws
-- canvas-native panning without map regeneration
-- reduced dynamic NPC detail at distant zoom levels
-- vector redraws for semantic location icons at high zoom to keep them sharper
-- generated scene reuse instead of regenerating existing child locations
+### Grid and input
 
-## Core context-aware generation
+- Square and hex overlays remain available from the toolbar.
+- Enabling a grid immediately snaps all movable objects when snapping is enabled.
+- Larger entities keep their size and record their multi-cell footprint while their center snaps to the nearest valid cell.
+- Mouse Button 4 and Button 5 can zoom while the pointer/focus is on the map.
 
-A selected area is analyzed before anything is generated. The app considers:
+### Assets and transforms
 
-- current hierarchy level
-- dominant biome
-- every major location inside the selection
-- selection scale
-- inherited roads/trails/rivers
-- buildings and rooms at the current hierarchy level
-- existing generated children
+Imported PNGs remain editable and persistent.
 
-That context determines the allowed generator and LOD.
+- rename assets
+- reversible pixelation from the original PNG
+- resize/scale
+- rotate
+- horizontal/vertical flip
+- move/reposition
+- preserve transparency
+- texture replacement slots
 
-## Features
+Assigned replacement textures are read dynamically by the editor, so supported existing semantic objects/furniture update without leaving placeholder squares.
 
-### Persistent world exploration
+### Experimental 2.5D view
 
-- Persistent linked scene hierarchy
-- Double-click towns, castles, caves, and mage towers to generate/enter them
-- Double-click buildings to generate interiors
-- Double-click rooms for room-scale detail
-- Double-click previously generated map areas to revisit them
-- Scroll-wheel zoom
-- Animated transitions between existing scenes
-- Parent/child links remain persistent in saved campaigns
+The **View** tab contains an initial Experimental 2.5D renderer.
 
-### Logical terrain detail
+It is not a second world generator. It renders the same current `Scene` data with:
 
-- Town buildings cluster along local streets
-- Regional roads retain their geometry in child maps
-- Road scenes add roadside vegetation, signs, carts, and travelers
-- Ocean scenes use boats, shipwrecks, islands, sea ruins, and ocean monuments
-- Forest scenes use forest-compatible structures and vegetation
-- Dry/desert terrain uses compatible ruins, camps, and sparse vegetation
-- Hills/mountains use caves, mines, forts, ruins, and rocky details
-- Biome restrictions prevent land structures from appearing in open ocean
+- terrain elevation
+- tilt
+- horizontal rotation
+- elevation exaggeration
+- roads/rivers
+- extruded buildings and landmarks
+- taller towers and multi-floor buildings
+- larger physical scale for dragons/large creatures
 
-### Building interiors
+The renderer uses a bounded terrain mesh so it remains practical on large maps. Normal 2D remains the editing-first view.
 
-Interiors are generated as coherent building footprints. Areas outside the walls remain exterior terrain rather than unexplained floor space.
+![Experimental 2.5D view](screenshots/experimental_2_5d.png)
 
-Profiles include:
+### Persistent saves
 
-- Houses
-- Taverns
-- Blacksmiths
-- Shops
-- Libraries
-- Temples
-- Wizard buildings
-- Castles
-- Farmhouses
+`.cforge` projects save the campaign rather than only an image:
 
-Profiles use different room purposes, floor materials, wall styles, and furniture.
-
-### NPCs and custom assets
-
-- Built-in draggable NPC palette
-- Persistent movable NPCs
-- Transparent PNG import
-- Place imported PNGs anywhere on a scene
-- Reusable asset library
-- Texture replacement slots for buildings, terrain objects, furniture, carts, boats, and NPCs
-
-### Generation rules
-
-The Rules tab can toggle categories including:
-
-- Towns
-- Houses
-- Roads
-- Ruins / caves
-- Dungeons
-- Castles
-- NPCs
-- Boats
-- Carts
-- Furniture
-- Wildlife
-- Biome decoration
-- Ocean structures
-- Underground structures
-
-Biome compatibility is still enforced when a category is enabled.
-
-### Project persistence
-
-Save the campaign as a `.cforge` project. Projects store:
-
-- generated scenes
-- scene hierarchy
-- source rectangles
-- entities and moved positions
-- roads and location identities
-- imported PNG assets
-- asset names and pixelation settings
-- object transform metadata
-- assigned texture replacements
+- generated scene hierarchy
+- current scene
+- parent/child links
+- roads and paths
+- buildings/floors/rooms
+- NPCs, furniture, and custom PNG objects
+- asset library and texture assignments
 - generation settings
+- grid state
+- zoom and viewport position
+- 2D/2.5D view and experimental camera state
 
-### Aspect-ratio-safe detail maps
+Portable builds use a local `CampaignForge Saves` directory beside the EXE when writable and fall back to the user's local application-data directory otherwise. Autosave and named local saves are both supported.
 
-Selections are never forced into a fixed shape. Detail dimensions are calculated from the source rectangle, and terrain is rebuilt from parent biome data instead of stretching a screenshot.
-
-### Grid overlays
-
-- Square grid
-- Hex grid
-- Adjustable cell size
-
-## Screenshots
-
-### Multi-location regional LOD
-
-![Multi-location regional detail](screenshots/multi_city_lod.png)
-
-### Town detail
-
-![Town detail](screenshots/town.png)
-
-### Castle detail
-
-![Castle detail](screenshots/castle.png)
-
-### Mage tower detail
-
-![Mage tower detail](screenshots/mage_tower.png)
-
-### Cave detail
-
-![Cave detail](screenshots/cave.png)
-
-### Building interior
-
-![Building interior](screenshots/building.png)
-
-### Road encounter
-
-![Road encounter](screenshots/road.png)
-
-### Ocean detail
-
-![Ocean detail](screenshots/ocean.png)
-
-## Running from source
+## Run from source
 
 Requirements:
 
@@ -233,59 +147,41 @@ Requirements:
 - Pillow
 - Tkinter
 
-Install:
-
 ```bash
 python -m pip install -r requirements.txt
-```
-
-Run:
-
-```bash
 python campaign_forge.py
 ```
 
-On Windows you can also double-click `run.bat`.
+On Windows, `run.bat` is also included.
 
-## Building the portable Windows EXE
+## Build the portable Windows EXE
 
-On Windows, double-click:
+Run on Windows:
 
 ```text
 build_windows.bat
 ```
 
-The result is:
+The one-file executable is created at:
 
 ```text
 dist\CampaignForge.exe
 ```
 
-It is a one-file portable executable and does not require an installer.
-
-## GitHub Actions Windows build
-
-The included workflow builds the portable EXE on GitHub's Windows runner.
-
-1. Push the repository to GitHub.
-2. Open **Actions**.
-3. Run **Build Windows Portable**.
-4. Download the `CampaignForge-Windows-Portable` artifact.
-
-A `v1.0.0` tag can also create a GitHub Release containing the portable ZIP.
+The GitHub Actions workflow also runs the automated tests and builds `CampaignForge-v1.1.0-Windows-Portable.zip` on a Windows runner.
 
 ## Tests
-
-Run:
 
 ```bash
 python tests/smoke_generation.py
 python tests/lod_and_editor_features.py
+python tests/version2_features.py
+python tests/update_110_features.py
 ```
 
-The LOD/editor tests cover multi-city selection, relative-position preservation, road entrance continuity, castle/cave/mage-tower generation, safe sub-area deletion, and reversible imported-image editing.
+The 1.1.0 tests cover exact inherited road counts, special-location identity, terminal cave depth, multi-floor persistence, movable furniture, parent-facing entrances, and same-scene Experimental 2.5D rendering.
 
-## Project structure
+## Project layout
 
 ```text
 campaign_forge.py
@@ -294,20 +190,19 @@ campaignforge/
   assets.py
   biomes.py
   context.py
+  experimental.py
   generators.py
+  grid.py
+  local_saves.py
   model.py
   persistence.py
   world_engine.py
-assets/
-screenshots/
 tests/
-ARCHITECTURE.md
+.github/workflows/build-windows.yml
 CampaignForge.spec
 build_windows.bat
 ```
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the hierarchy, identity, LOD, road-continuity, and rendering design.
-
 ## License
 
-MIT
+MIT.

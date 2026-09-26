@@ -29,7 +29,8 @@ def run() -> None:
     for _ in ocean.generate():
         pass
     assert all(entity.metadata.get("biome") == "ocean" for entity in ocean.entities)
-    assert interior.entities and all(entity.kind == "room" for entity in interior.entities)
+    assert any(entity.kind == "room" for entity in interior.entities)
+    assert any(entity.kind == "object" for entity in interior.entities)
 
 
 if __name__ == "__main__":

@@ -43,8 +43,28 @@ class AssetLibrary:
         "furniture.table",
         "furniture.chair",
         "furniture.bed",
+        "furniture.chest",
+        "furniture.shelf",
+        "furniture.wardrobe",
+        "furniture.lamp",
+        "furniture.desk",
+        "furniture.cabinet",
+        "furniture.rug",
+        "furniture.fireplace",
+        "object.barrel",
+        "object.crate",
+        "object.plant",
+        "object.weapon_rack",
         "object.cart",
         "object.boat",
+        "object.bench",
+        "object.sign",
+        "object.market_stall",
+        "object.well",
+        "object.statue",
+        "object.fence",
+        "object.treasure",
+        "object.campfire",
     ]
 
     def __init__(self) -> None:
@@ -123,7 +143,7 @@ class AssetLibrary:
             img = img.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
         if flip_v:
             img = img.transpose(Image.Transpose.FLIP_TOP_BOTTOM)
-        img.thumbnail((width, height), Image.Resampling.LANCZOS)
+        img = img.resize((width, height), Image.Resampling.LANCZOS)
         if rotation:
             img = img.rotate(-rotation, expand=True, resample=Image.Resampling.BICUBIC)
         if len(self.scaled_cache) > 96:

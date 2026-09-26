@@ -21,8 +21,14 @@ from .biomes import WATER_BIOMES, rect_aspect_dimensions
 from .context import SelectionContext, context_for_entity, resolve_selection, road_entrances_for_entity
 from .generators import (
     BuildingInteriorGenerator,
+    BuildingSectionGenerator,
     CastleGenerator,
     CaveGenerator,
+    DeepCaveGenerator,
+    DragonLairGenerator,
+    BanditCampGenerator,
+    FortGenerator,
+    RuinedCityGenerator,
     ContextRegionGenerator,
     DetailSettings,
     MageTowerGenerator,
@@ -35,6 +41,9 @@ from .generators import (
 )
 from .model import CampaignState, Entity, GenerationConfig, Scene
 from .persistence import load_campaign, save_campaign
+from .local_saves import autosave_path, clean_save_name, list_local_saves, save_path, saves_directory
+from .grid import snap_point as grid_snap_point
+from .experimental import render_experimental
 
 
 class CampaignForgeApp:
@@ -50,7 +59,7 @@ class CampaignForgeApp:
         "Detailed · up to 1500 × 1100": (1500, 1100),
         "High Detail · up to 2000 × 1500": (2000, 1500),
     }
-    NPC_TYPES = ["Villager", "Guard", "Merchant", "Traveler", "Mage", "Bandit"]
+    NPC_TYPES = ["Villager", "Guard", "Merchant", "Traveler", "Mage", "Bandit", "Goblin", "Orc", "Skeleton", "Wolf", "Giant Spider", "Dragon"]
     NPC_COLORS = {
         "Villager": "#d3a35d",
         "Guard": "#7c9fc7",
@@ -58,13 +67,33 @@ class CampaignForgeApp:
         "Traveler": "#9ac17f",
         "Mage": "#9a7bd1",
         "Bandit": "#b96d67",
+        "Goblin": "#7e9b58",
+        "Orc": "#748b55",
+        "Skeleton": "#d2d0c2",
+        "Wolf": "#85898e",
+        "Giant Spider": "#4e4647",
+        "Dragon": "#a6493f",
+    }
+    OBJECT_CATEGORIES = {
+        "Furniture": ["Table", "Chair", "Bed", "Chest", "Wardrobe", "Bookshelf", "Lamp", "Desk", "Cabinet", "Rug", "Fireplace", "Chess Board"],
+        "Storage & Craft": ["Barrel", "Crate", "Workbench", "Weapon Rack", "Anvil", "Forge"],
+        "Exterior": ["Bench", "Road Sign", "Market Stall", "Well", "Statue", "Plant", "Cart", "Fence"],
+        "Adventure": ["Treasure", "Bones", "Campfire", "Altar"],
+    }
+    OBJECT_SIZES = {
+        "table": (58,34), "chair": (20,20), "bed": (52,78), "chest": (38,26), "wardrobe": (40,58),
+        "bookshelf": (28,64), "lamp": (18,18), "desk": (58,34), "cabinet": (34,58), "rug": (88,54),
+        "fireplace": (40,55), "barrel": (28,28), "crate": (30,26), "workbench": (70,32), "weapon_rack": (30,70),
+        "anvil": (36,30), "forge": (54,46), "bench": (44,18), "road_sign": (28,34), "market_stall": (58,40),
+        "well": (48,48), "statue": (32,48), "plant": (20,24), "cart": (58,36), "fence": (70,16), "treasure": (50,34),
+        "bones": (42,28), "campfire": (38,38), "altar": (70,34), "chess_board": (42,42),
     }
 
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("CampaignForge 1.0 · Context-Aware World Builder")
+        self.root.title("CampaignForge 1.1.0 · Persistent World Builder")
         self.root.geometry("1580x960")
-        self.root.minsize(1120, 720)
+        self.root.minsize(1180, 760)
         self.state = CampaignState()
         self.assets = AssetLibrary()
         self.project_extract_dir: Optional[str] = None
@@ -91,10 +120,20 @@ class CampaignForgeApp:
         self._quality_after_id: Optional[str] = None
         self._drag_render_after_id: Optional[str] = None
         self._last_render_key: Optional[tuple] = None
+        self.last_grid_type = "Square"
+        self.current_local_save: Optional[Path] = None
+        self._autosave_after_id: Optional[str] = None
+        self._local_save_items: dict[str, Path] = {}
+        self.view_mode = tk.StringVar(value="Normal 2D")
+        self.camera_tilt = tk.DoubleVar(value=48.0)
+        self.camera_rotation = tk.DoubleVar(value=28.0)
+        self.camera_height = tk.DoubleVar(value=1.0)
+        self._experimental_cache: dict[tuple, Image.Image] = {}
         self._style()
         self._build_ui()
         self._random_seed()
-        self.root.after(220, self.new_world)
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.after(220, self._startup_project)
 
     def _style(self) -> None:
         self.root.configure(bg="#15181d")
@@ -129,6 +168,26 @@ class CampaignForgeApp:
         style.configure("TSpinbox", fieldbackground=field, foreground=fg)
         style.configure("TEntry", fieldbackground=field, foreground=fg)
 
+    def _make_scroll_tab(self, label: str) -> ttk.Frame:
+        holder = ttk.Frame(self.notebook, style="Panel.TFrame")
+        holder.columnconfigure(0, weight=1)
+        holder.rowconfigure(0, weight=1)
+        canvas = tk.Canvas(holder, bg="#20242b", highlightthickness=0, borderwidth=0)
+        bar = ttk.Scrollbar(holder, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=bar.set)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        bar.grid(row=0, column=1, sticky="ns")
+        inner = ttk.Frame(canvas, padding=10, style="Panel.TFrame")
+        window = canvas.create_window((0, 0), window=inner, anchor="nw")
+        def sync_region(_event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+        def sync_width(event):
+            canvas.itemconfigure(window, width=max(120, event.width))
+        inner.bind("<Configure>", sync_region)
+        canvas.bind("<Configure>", sync_width)
+        self.notebook.add(holder, text=label)
+        return inner
+
     def _build_ui(self) -> None:
         self.root.columnconfigure(1, weight=1)
         self.root.rowconfigure(0, weight=1)
@@ -150,28 +209,24 @@ class CampaignForgeApp:
 
         self.notebook = ttk.Notebook(sidebar, width=300)
         self.notebook.grid(row=2, column=0, sticky="nsew")
-        self.gen_tab = ttk.Frame(self.notebook, padding=10, style="Panel.TFrame")
-        self.struct_tab = ttk.Frame(self.notebook, padding=10, style="Panel.TFrame")
-        self.npc_tab = ttk.Frame(self.notebook, padding=10, style="Panel.TFrame")
-        self.asset_tab = ttk.Frame(self.notebook, padding=10, style="Panel.TFrame")
-        self.transform_tab = ttk.Frame(self.notebook, padding=10, style="Panel.TFrame")
-        self.campaign_tab = ttk.Frame(self.notebook, padding=10, style="Panel.TFrame")
-        self.notebook.add(self.gen_tab, text="Generate")
-        self.notebook.add(self.struct_tab, text="Rules")
-        self.notebook.add(self.npc_tab, text="NPCs")
-        self.notebook.add(self.asset_tab, text="Assets")
-        self.notebook.add(self.transform_tab, text="Transform")
-        self.notebook.add(self.campaign_tab, text="Campaign")
+        self.gen_tab = self._make_scroll_tab("Generate")
+        self.struct_tab = self._make_scroll_tab("Rules")
+        self.npc_tab = self._make_scroll_tab("NPCs")
+        self.asset_tab = self._make_scroll_tab("Assets")
+        self.transform_tab = self._make_scroll_tab("Transform")
+        self.view_tab = self._make_scroll_tab("View")
+        self.campaign_tab = self._make_scroll_tab("Campaign")
         self._build_generation_tab()
         self._build_rules_tab()
         self._build_npc_tab()
         self._build_assets_tab()
         self._build_transform_tab()
+        self._build_view_tab()
         self._build_campaign_tab()
 
         toolbar = ttk.Frame(main)
         toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 7))
-        toolbar.columnconfigure(10, weight=1)
+        toolbar.columnconfigure(12, weight=1)
         ttk.Button(toolbar, text="Select Area", command=self.select_mode).grid(row=0, column=0, padx=(0, 3))
         ttk.Button(toolbar, text="Generate Detail", style="Accent.TButton", command=self.make_detail).grid(row=0, column=1, padx=3)
         ttk.Button(toolbar, text="Back", command=self.go_parent).grid(row=0, column=2, padx=3)
@@ -179,10 +234,15 @@ class CampaignForgeApp:
         ttk.Button(toolbar, text="−", width=3, command=lambda: self.change_zoom(.82)).grid(row=0, column=4, padx=(9, 2))
         ttk.Button(toolbar, text="+", width=3, command=lambda: self.change_zoom(1.22)).grid(row=0, column=5, padx=2)
         self.zoom_label = ttk.Label(toolbar, text="100%")
-        self.zoom_label.grid(row=0, column=6, padx=(5, 12))
-        ttk.Label(toolbar, text="Double-click places to enter · wheel zooms").grid(row=0, column=7, padx=6)
+        self.zoom_label.grid(row=0, column=6, padx=(5, 8))
+        self.quick_grid_btn = ttk.Button(toolbar, text="Grid: Off", command=self.toggle_grid_quick)
+        self.quick_grid_btn.grid(row=0, column=7, padx=3)
+        ttk.Button(toolbar, text="Quick Save", command=self.quick_save_local).grid(row=0, column=8, padx=3)
+        self.view_toggle_btn = ttk.Button(toolbar, text="View: 2D", command=self.toggle_view_mode)
+        self.view_toggle_btn.grid(row=0, column=9, padx=3)
+        ttk.Label(toolbar, text="Double-click places to enter · wheel/side buttons zoom").grid(row=0, column=10, padx=6)
         self.layer_label = ttk.Label(toolbar, text="", anchor="e")
-        self.layer_label.grid(row=0, column=10, sticky="e")
+        self.layer_label.grid(row=0, column=12, sticky="e")
 
         viewport = ttk.Frame(main)
         viewport.grid(row=1, column=0, sticky="nsew")
@@ -200,8 +260,8 @@ class CampaignForgeApp:
         self.canvas.bind("<ButtonRelease-1>", self._release)
         self.canvas.bind("<Double-Button-1>", self._double_click)
         self.canvas.bind("<MouseWheel>", self._wheel)
-        self.canvas.bind("<Button-4>", lambda e: self._wheel_linux(e, 1))
-        self.canvas.bind("<Button-5>", lambda e: self._wheel_linux(e, -1))
+        self.root.bind_all("<Button-4>", self._side_zoom_in, add="+")
+        self.root.bind_all("<Button-5>", self._side_zoom_out, add="+")
         self.canvas.bind("<ButtonPress-2>", self._pan_start)
         self.canvas.bind("<B2-Motion>", self._pan_move)
         self.canvas.bind("<ButtonPress-3>", self._pan_start)
@@ -238,36 +298,56 @@ class CampaignForgeApp:
         ttk.Entry(seed, textvariable=self.seed_var).grid(row=0, column=0, sticky="ew")
         ttk.Button(seed, text="Random", command=self._random_seed).grid(row=0, column=1, padx=(5, 0))
         self.world_detail = tk.IntVar(value=6)
-        self.world_rivers = tk.IntVar(value=5)
+        self.world_rivers = tk.IntVar(value=0)
         self.world_towns = tk.IntVar(value=12)
         self._labeled_spin(t, "Terrain detail", self.world_detail, 1, 8, 4)
-        self._labeled_spin(t, "Rivers", self.world_rivers, 0, 16, 6)
-        self._labeled_spin(t, "Settlements", self.world_towns, 0, 30, 8)
-        ttk.Button(t, text="Generate New World", style="Accent.TButton", command=self.new_world).grid(row=10, column=0, sticky="ew", pady=(11, 3))
+        self._labeled_spin(t, "Settlements", self.world_towns, 0, 30, 6)
+        ttk.Label(t, text="Rivers are generated automatically from altitude + moisture.", wraplength=260, style="Panel.TLabel").grid(row=8, column=0, sticky="w", pady=(5,0))
 
-        ttk.Separator(t).grid(row=11, column=0, sticky="ew", pady=10)
-        ttk.Label(t, text="Detail generation", style="Section.TLabel").grid(row=12, column=0, sticky="w")
+        ttk.Separator(t).grid(row=10, column=0, sticky="ew", pady=9)
+        ttk.Label(t, text="Climate & elevation", style="Section.TLabel").grid(row=11, column=0, sticky="w")
+        self.temperature_var = tk.IntVar(value=self.state.config.temperature)
+        self.altitude_var = tk.IntVar(value=self.state.config.max_altitude)
+        self.moisture_var = tk.IntVar(value=self.state.config.moisture)
+        climate = ttk.Frame(t, style="Panel.TFrame")
+        climate.grid(row=12, column=0, sticky="ew", pady=(4, 0))
+        climate.columnconfigure(1, weight=1)
+        ttk.Label(climate, text="Temperature", style="Panel.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Scale(climate, from_=0, to=100, variable=self.temperature_var, orient="horizontal", command=lambda _v: self._sync_config()).grid(row=0, column=1, sticky="ew", padx=5)
+        ttk.Label(climate, textvariable=self.temperature_var, width=3, style="Panel.TLabel").grid(row=0, column=2, sticky="e")
+        ttk.Label(climate, text="Max altitude", style="Panel.TLabel").grid(row=1, column=0, sticky="w")
+        ttk.Scale(climate, from_=0, to=100, variable=self.altitude_var, orient="horizontal", command=lambda _v: self._sync_config()).grid(row=1, column=1, sticky="ew", padx=5)
+        ttk.Label(climate, textvariable=self.altitude_var, width=3, style="Panel.TLabel").grid(row=1, column=2, sticky="e")
+        ttk.Label(climate, text="Moisture", style="Panel.TLabel").grid(row=2, column=0, sticky="w")
+        ttk.Scale(climate, from_=0, to=100, variable=self.moisture_var, orient="horizontal", command=lambda _v: self._sync_config()).grid(row=2, column=1, sticky="ew", padx=5)
+        ttk.Label(climate, textvariable=self.moisture_var, width=3, style="Panel.TLabel").grid(row=2, column=2, sticky="e")
+        self.smooth_terrain_var = tk.BooleanVar(value=self.state.config.experimental_smooth_terrain)
+        ttk.Checkbutton(t, text="Experimental smoother terrain preview", variable=self.smooth_terrain_var, command=self._sync_config).grid(row=13, column=0, sticky="w", pady=(4, 0))
+        ttk.Button(t, text="Generate New World", style="Accent.TButton", command=self.new_world).grid(row=14, column=0, sticky="ew", pady=(10, 3))
+
+        ttk.Separator(t).grid(row=15, column=0, sticky="ew", pady=9)
+        ttk.Label(t, text="Detail generation", style="Section.TLabel").grid(row=16, column=0, sticky="w")
         self.detail_preset = tk.StringVar(value="Detailed · up to 1500 × 1100")
-        ttk.Combobox(t, textvariable=self.detail_preset, values=list(self.DETAIL_PRESETS), state="readonly").grid(row=13, column=0, sticky="ew", pady=(5, 3))
+        ttk.Combobox(t, textvariable=self.detail_preset, values=list(self.DETAIL_PRESETS), state="readonly").grid(row=17, column=0, sticky="ew", pady=(5, 3))
         self.detail_density = tk.IntVar(value=7)
         self.detail_structures = tk.IntVar(value=18)
         self.detail_landmarks = tk.IntVar(value=7)
-        self._labeled_spin(t, "Local density", self.detail_density, 1, 10, 14)
-        self._labeled_spin(t, "Structures", self.detail_structures, 0, 60, 16)
-        self._labeled_spin(t, "Landmarks", self.detail_landmarks, 0, 25, 18)
+        self._labeled_spin(t, "Local density", self.detail_density, 1, 10, 18)
+        self._labeled_spin(t, "Structures", self.detail_structures, 0, 60, 20)
+        self._labeled_spin(t, "Landmarks", self.detail_landmarks, 0, 25, 22)
         self.speed_var = tk.IntVar(value=82)
-        ttk.Label(t, text="Generation speed", style="Panel.TLabel").grid(row=20, column=0, sticky="w", pady=(7, 0))
-        ttk.Scale(t, from_=1, to=100, variable=self.speed_var, orient="horizontal").grid(row=21, column=0, sticky="ew")
+        ttk.Label(t, text="Generation speed", style="Panel.TLabel").grid(row=24, column=0, sticky="w", pady=(7, 0))
+        ttk.Scale(t, from_=1, to=100, variable=self.speed_var, orient="horizontal").grid(row=25, column=0, sticky="ew")
         self.pause_btn = ttk.Button(t, text="Pause", state="disabled", command=self.toggle_pause)
-        self.pause_btn.grid(row=22, column=0, sticky="ew", pady=(10, 3))
+        self.pause_btn.grid(row=26, column=0, sticky="ew", pady=(10, 3))
         self.step_btn = ttk.Button(t, text="Single Step", state="disabled", command=self.single_step)
-        self.step_btn.grid(row=23, column=0, sticky="ew", pady=3)
+        self.step_btn.grid(row=27, column=0, sticky="ew", pady=3)
 
     def _build_rules_tab(self) -> None:
         t = self.struct_tab
         t.columnconfigure(0, weight=1)
         ttk.Label(t, text="Generation rules", style="Section.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Label(t, text="Biome restrictions are always enforced. These switches control which categories may be generated.", wraplength=260, style="Panel.TLabel").grid(row=1, column=0, sticky="w", pady=(5, 8))
+        ttk.Label(t, text="Biome restrictions remain enforced. These switches control broad categories.", wraplength=260, style="Panel.TLabel").grid(row=1, column=0, sticky="w", pady=(5, 8))
         self.rule_vars: dict[str, tk.BooleanVar] = {}
         labels = [
             ("towns", "Towns"), ("houses", "Houses & civilian buildings"), ("roads", "Roads & paths"),
@@ -280,30 +360,50 @@ class CampaignForgeApp:
             var = tk.BooleanVar(value=getattr(self.state.config, key))
             self.rule_vars[key] = var
             ttk.Checkbutton(t, text=label, variable=var, command=self._sync_config).grid(row=row, column=0, sticky="w", pady=1)
-        ttk.Separator(t).grid(row=17, column=0, sticky="ew", pady=10)
-        ttk.Label(t, text="Grid overlay", style="Section.TLabel").grid(row=18, column=0, sticky="w")
+
+        ttk.Separator(t).grid(row=16, column=0, sticky="ew", pady=8)
+        ttk.Label(t, text="Road network", style="Section.TLabel").grid(row=17, column=0, sticky="w")
+        road = ttk.Frame(t, style="Panel.TFrame")
+        road.grid(row=18, column=0, sticky="ew", pady=(4, 0))
+        road.columnconfigure((1,3), weight=1)
+        self.road_min_var = tk.IntVar(value=self.state.config.road_min_per_settlement)
+        self.road_max_var = tk.IntVar(value=self.state.config.road_max_per_settlement)
+        ttk.Label(road, text="Roads/settlement", style="Panel.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Spinbox(road, from_=0, to=8, width=4, textvariable=self.road_min_var, command=self._sync_config).grid(row=0, column=1, sticky="ew", padx=(5,2))
+        ttk.Label(road, text="to", style="Panel.TLabel").grid(row=0, column=2)
+        ttk.Spinbox(road, from_=0, to=8, width=4, textvariable=self.road_max_var, command=self._sync_config).grid(row=0, column=3, sticky="ew", padx=(2,0))
+        self.road_chance_var = tk.IntVar(value=self.state.config.road_connection_chance)
+        ttk.Label(road, text="Connection %", style="Panel.TLabel").grid(row=1, column=0, sticky="w", pady=(4,0))
+        ttk.Spinbox(road, from_=0, to=100, increment=5, textvariable=self.road_chance_var, command=self._sync_config).grid(row=1, column=1, columnspan=3, sticky="ew", padx=(5,0), pady=(4,0))
+        self.ruin_chance_var = tk.IntVar(value=self.state.config.rare_ruin_chance)
+        ttk.Label(road, text="Rare ruins %", style="Panel.TLabel").grid(row=2, column=0, sticky="w", pady=(4,0))
+        ttk.Spinbox(road, from_=0, to=25, textvariable=self.ruin_chance_var, command=self._sync_config).grid(row=2, column=1, columnspan=3, sticky="ew", padx=(5,0), pady=(4,0))
+
+        ttk.Separator(t).grid(row=19, column=0, sticky="ew", pady=8)
+        ttk.Label(t, text="Grid overlay", style="Section.TLabel").grid(row=20, column=0, sticky="w")
         self.grid_type = tk.StringVar(value="None")
-        ttk.Combobox(t, textvariable=self.grid_type, values=["None", "Square", "Hex"], state="readonly").grid(row=19, column=0, sticky="ew", pady=(4, 3))
+        grid_box = ttk.Combobox(t, textvariable=self.grid_type, values=["None", "Square", "Hex"], state="readonly")
+        grid_box.grid(row=21, column=0, sticky="ew", pady=(4, 3))
+        grid_box.bind("<<ComboboxSelected>>", self._grid_type_changed)
         self.grid_size = tk.IntVar(value=48)
-        self._labeled_spin(t, "Cell size", self.grid_size, 18, 140, 20)
-        ttk.Button(t, text="Refresh Grid", command=self.render).grid(row=22, column=0, sticky="ew", pady=(5, 0))
+        self._labeled_spin(t, "Cell size", self.grid_size, 18, 140, 22)
+        self.snap_grid_var = tk.BooleanVar(value=self.state.config.snap_to_grid)
+        ttk.Checkbutton(t, text="Snap movable objects to grid", variable=self.snap_grid_var, command=self._snap_setting_changed).grid(row=24, column=0, sticky="w", pady=(5, 2))
+        ttk.Button(t, text="Refresh Grid", command=self._grid_type_changed).grid(row=25, column=0, sticky="ew", pady=(3, 0))
 
     def _build_npc_tab(self) -> None:
         t = self.npc_tab
         t.columnconfigure(0, weight=1)
         ttk.Label(t, text="NPC palette", style="Section.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Label(t, text="Drag a token from this palette onto the map, or choose one and click Place NPC.", wraplength=260, style="Panel.TLabel").grid(row=1, column=0, sticky="w", pady=(5, 8))
-        self.npc_palette = tk.Canvas(t, height=245, bg="#1b1f25", highlightthickness=1, highlightbackground="#353b45")
+        ttk.Label(t, text="Drag a token directly from the palette onto the map. This is the single placement workflow for built-in NPCs.", wraplength=260, style="Panel.TLabel").grid(row=1, column=0, sticky="w", pady=(5, 8))
+        self.npc_palette = tk.Canvas(t, height=430, bg="#1b1f25", highlightthickness=1, highlightbackground="#353b45")
         self.npc_palette.grid(row=2, column=0, sticky="ew")
         self._draw_npc_palette()
         self.npc_palette.bind("<ButtonPress-1>", self._npc_palette_press)
         self.npc_palette.bind("<ButtonRelease-1>", self._npc_palette_release)
-        self.npc_choice = tk.StringVar(value=self.NPC_TYPES[0])
-        ttk.Combobox(t, textvariable=self.npc_choice, values=self.NPC_TYPES, state="readonly").grid(row=3, column=0, sticky="ew", pady=(8, 3))
-        ttk.Button(t, text="Place NPC", command=lambda: self._arm_place("npc", self.npc_choice.get())).grid(row=4, column=0, sticky="ew", pady=3)
-        ttk.Separator(t).grid(row=5, column=0, sticky="ew", pady=10)
-        ttk.Label(t, text="Select a placed NPC or PNG on the map, then use the Transform tab for scaling, rotation, flips, and exact dimensions.", wraplength=260, style="Panel.TLabel").grid(row=6, column=0, sticky="w")
-        ttk.Button(t, text="Delete Selected Object", command=self.delete_selected_entity).grid(row=7, column=0, sticky="ew", pady=(8, 3))
+        ttk.Separator(t).grid(row=3, column=0, sticky="ew", pady=10)
+        ttk.Label(t, text="Select a placed NPC, creature, furniture item, or PNG on the map, then use Transform for scale, rotation, flips, and exact dimensions.", wraplength=260, style="Panel.TLabel").grid(row=4, column=0, sticky="w")
+        ttk.Button(t, text="Delete Selected Object", command=self.delete_selected_entity).grid(row=5, column=0, sticky="ew", pady=(8, 3))
 
     def _build_assets_tab(self) -> None:
         t = self.asset_tab
@@ -337,6 +437,16 @@ class CampaignForgeApp:
         ttk.Button(t, text="Assign Selected PNG", command=self.assign_texture).grid(row=10, column=0, sticky="ew", pady=3)
         self.texture_status = ttk.Label(t, text="Built-in texture", style="Panel.TLabel")
         self.texture_status.grid(row=11, column=0, sticky="w", pady=(5, 0))
+        ttk.Separator(t).grid(row=12, column=0, sticky="ew", pady=10)
+        ttk.Label(t, text="Built-in object palette", style="Section.TLabel").grid(row=13, column=0, sticky="w")
+        self.object_category = tk.StringVar(value=next(iter(self.OBJECT_CATEGORIES)))
+        obj_cat = ttk.Combobox(t, textvariable=self.object_category, values=list(self.OBJECT_CATEGORIES), state="readonly")
+        obj_cat.grid(row=14, column=0, sticky="ew", pady=(5,3))
+        obj_cat.bind("<<ComboboxSelected>>", lambda _e: self._refresh_object_palette())
+        self.object_list = tk.Listbox(t, height=6, bg="#1c2026", fg="#e7e9ee", selectbackground="#3d5f9e", borderwidth=0, highlightthickness=1, highlightbackground="#343a45", exportselection=False)
+        self.object_list.grid(row=15, column=0, sticky="ew")
+        self._refresh_object_palette()
+        ttk.Button(t, text="Place Selected Object", command=self.arm_selected_object).grid(row=16, column=0, sticky="ew", pady=(5,2))
 
     def _build_transform_tab(self) -> None:
         t = self.transform_tab
@@ -375,24 +485,59 @@ class CampaignForgeApp:
         self.transform_status = ttk.Label(t, text="No object selected", wraplength=260, style="Panel.TLabel")
         self.transform_status.grid(row=12, column=0, sticky="w", pady=(7, 0))
 
+    def _build_view_tab(self) -> None:
+        t = self.view_tab
+        t.columnconfigure(0, weight=1)
+        ttk.Label(t, text="World view", style="Section.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(t, text="Normal 2D and Experimental 2.5D read the same persistent world. Switching views never regenerates locations.", wraplength=260, style="Panel.TLabel").grid(row=1, column=0, sticky="w", pady=(5,8))
+        mode = ttk.Combobox(t, textvariable=self.view_mode, values=["Normal 2D", "Experimental 2.5D"], state="readonly")
+        mode.grid(row=2, column=0, sticky="ew")
+        mode.bind("<<ComboboxSelected>>", lambda _e: self._view_mode_changed())
+        ttk.Separator(t).grid(row=3, column=0, sticky="ew", pady=10)
+        ttk.Label(t, text="Experimental camera", style="Section.TLabel").grid(row=4, column=0, sticky="w")
+        ttk.Label(t, text="Tilt", style="Panel.TLabel").grid(row=5, column=0, sticky="w", pady=(5,0))
+        ttk.Scale(t, from_=0, to=70, variable=self.camera_tilt, orient="horizontal", command=lambda _v: self._experimental_camera_changed()).grid(row=6, column=0, sticky="ew")
+        ttk.Label(t, text="Rotation", style="Panel.TLabel").grid(row=7, column=0, sticky="w", pady=(5,0))
+        ttk.Scale(t, from_=0, to=359, variable=self.camera_rotation, orient="horizontal", command=lambda _v: self._experimental_camera_changed()).grid(row=8, column=0, sticky="ew")
+        ttk.Label(t, text="Elevation exaggeration", style="Panel.TLabel").grid(row=9, column=0, sticky="w", pady=(5,0))
+        ttk.Scale(t, from_=0.25, to=2.4, variable=self.camera_height, orient="horizontal", command=lambda _v: self._experimental_camera_changed()).grid(row=10, column=0, sticky="ew")
+        ttk.Button(t, text="Reset Camera", command=self.reset_experimental_camera).grid(row=11, column=0, sticky="ew", pady=(10,3))
+        ttk.Label(t, text="2.5D is intentionally lightweight: terrain height, roads, structures, towers, walls, NPC scale, and large creatures are visualized from the same scene data.", wraplength=260, style="Panel.TLabel").grid(row=12, column=0, sticky="w", pady=(8,0))
+
     def _build_campaign_tab(self) -> None:
         t = self.campaign_tab
         t.columnconfigure(0, weight=1)
         t.rowconfigure(2, weight=1)
         ttk.Label(t, text="Persistent world", style="Section.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Label(t, text="Generated scenes remain linked to their parent locations. Double-click a scene below to jump to it.", wraplength=260, style="Panel.TLabel").grid(row=1, column=0, sticky="w", pady=(5, 8))
-        self.scene_tree = ttk.Treeview(t, show="tree", height=15)
+        ttk.Label(t, text="Generated scenes stay linked. Local saves preserve the whole hierarchy and reopen on the same scene.", wraplength=260, style="Panel.TLabel").grid(row=1, column=0, sticky="w", pady=(5, 8))
+        self.scene_tree = ttk.Treeview(t, show="tree", height=10)
         self.scene_tree.grid(row=2, column=0, sticky="nsew")
         self.scene_tree.bind("<Double-1>", self._tree_open)
         buttons = ttk.Frame(t, style="Panel.TFrame")
         buttons.grid(row=3, column=0, sticky="ew", pady=(7, 0))
         buttons.columnconfigure((0, 1), weight=1)
-        ttk.Button(buttons, text="Save Project", command=self.save_project).grid(row=0, column=0, sticky="ew", padx=(0, 3), pady=2)
-        ttk.Button(buttons, text="Open Project", command=self.open_project).grid(row=0, column=1, sticky="ew", padx=(3, 0), pady=2)
+        ttk.Button(buttons, text="Save Project…", command=self.save_project).grid(row=0, column=0, sticky="ew", padx=(0, 3), pady=2)
+        ttk.Button(buttons, text="Open Project…", command=self.open_project).grid(row=0, column=1, sticky="ew", padx=(3, 0), pady=2)
         ttk.Button(buttons, text="Export PNG", command=self.export_png).grid(row=1, column=0, sticky="ew", padx=(0, 3), pady=2)
         ttk.Button(buttons, text="Export Pack", command=self.export_pack).grid(row=1, column=1, sticky="ew", padx=(3, 0), pady=2)
         ttk.Button(t, text="Rename Current Scene", command=self.rename_scene).grid(row=4, column=0, sticky="ew", pady=(6, 2))
         ttk.Button(t, text="Delete Selected Sub-Area", command=self.delete_selected_scene).grid(row=5, column=0, sticky="ew", pady=2)
+
+        ttk.Separator(t).grid(row=6, column=0, sticky="ew", pady=8)
+        ttk.Label(t, text="Local saves", style="Section.TLabel").grid(row=7, column=0, sticky="w")
+        self.local_save_choice = tk.StringVar()
+        self.local_save_box = ttk.Combobox(t, textvariable=self.local_save_choice, state="readonly")
+        self.local_save_box.grid(row=8, column=0, sticky="ew", pady=(4,3))
+        local_buttons = ttk.Frame(t, style="Panel.TFrame")
+        local_buttons.grid(row=9, column=0, sticky="ew")
+        local_buttons.columnconfigure((0,1), weight=1)
+        ttk.Button(local_buttons, text="Quick Save", command=self.quick_save_local).grid(row=0, column=0, sticky="ew", padx=(0,3), pady=2)
+        ttk.Button(local_buttons, text="Save As…", command=self.save_local_as).grid(row=0, column=1, sticky="ew", padx=(3,0), pady=2)
+        ttk.Button(local_buttons, text="Load Selected", command=self.load_selected_local).grid(row=1, column=0, sticky="ew", padx=(0,3), pady=2)
+        ttk.Button(local_buttons, text="Delete Save", command=self.delete_selected_local_save).grid(row=1, column=1, sticky="ew", padx=(3,0), pady=2)
+        self.local_save_status = ttk.Label(t, text="", style="Panel.TLabel", wraplength=260)
+        self.local_save_status.grid(row=10, column=0, sticky="w", pady=(5,0))
+        self._refresh_local_saves()
 
     def _labeled_spin(self, parent, label, var, lo, hi, row) -> None:
         ttk.Label(parent, text=label, style="Panel.TLabel").grid(row=row, column=0, sticky="w", pady=(6, 0))
@@ -407,6 +552,25 @@ class CampaignForgeApp:
     def _sync_config(self) -> None:
         for key, var in self.rule_vars.items():
             setattr(self.state.config, key, bool(var.get()))
+        if hasattr(self, "temperature_var"):
+            self.state.config.temperature = int(self.temperature_var.get())
+        if hasattr(self, "altitude_var"):
+            self.state.config.max_altitude = int(self.altitude_var.get())
+        if hasattr(self, "moisture_var"):
+            self.state.config.moisture = int(self.moisture_var.get())
+        if hasattr(self, "road_min_var"):
+            self.state.config.road_min_per_settlement = int(self.road_min_var.get())
+        if hasattr(self, "road_max_var"):
+            self.state.config.road_max_per_settlement = int(self.road_max_var.get())
+        if hasattr(self, "road_chance_var"):
+            self.state.config.road_connection_chance = int(self.road_chance_var.get())
+        if hasattr(self, "ruin_chance_var"):
+            self.state.config.rare_ruin_chance = int(self.ruin_chance_var.get())
+        if hasattr(self, "snap_grid_var"):
+            self.state.config.snap_to_grid = bool(self.snap_grid_var.get())
+        if hasattr(self, "smooth_terrain_var"):
+            self.state.config.experimental_smooth_terrain = bool(self.smooth_terrain_var.get())
+        self.state.config.normalize()
 
     def _random_seed(self) -> None:
         self.seed_var.set(str(random.SystemRandom().randint(1, 2_147_483_647)))
@@ -433,7 +597,18 @@ class CampaignForgeApp:
     def new_world(self) -> None:
         self._sync_config()
         seed = self._seed()
-        settings = MapSettings(int(self.world_w.get()), int(self.world_h.get()), seed, int(self.world_detail.get()), int(self.world_rivers.get()), int(self.world_towns.get()))
+        settings = MapSettings(
+            int(self.world_w.get()), int(self.world_h.get()), seed, int(self.world_detail.get()),
+            int(self.world_rivers.get()), int(self.world_towns.get()),
+            temperature=self.state.config.temperature,
+            max_altitude=self.state.config.max_altitude,
+            moisture=self.state.config.moisture,
+            road_min_per_settlement=self.state.config.road_min_per_settlement,
+            road_max_per_settlement=self.state.config.road_max_per_settlement,
+            road_connection_chance=self.state.config.road_connection_chance,
+            rare_ruin_chance=self.state.config.rare_ruin_chance,
+            smooth_terrain=self.state.config.experimental_smooth_terrain,
+        )
         generator = WorldSceneGenerator(settings, self.state.config, self._status)
         self.state = CampaignState(config=self.state.config, title=self.state.title)
         self._invalidate_render_cache()
@@ -445,8 +620,8 @@ class CampaignForgeApp:
         scene = self.state.current()
         if not scene:
             return
-        if scene.kind == "room":
-            self.status_var.set("Room detail is the deepest generated level. Add, move, or resize NPCs and custom PNG objects here.")
+        if scene.kind in {"room", "cavern", "dragon_lair"} or scene.metadata.get("terminal"):
+            self.status_var.set("This is a terminal detail level. Customize NPCs, creatures, furniture, and objects here instead of generating another nested copy.")
             return
         rect = self._selection_for(scene)
         if not rect:
@@ -496,12 +671,53 @@ class CampaignForgeApp:
             generator = CaveGenerator(focus, settings, self.state.config, self.assets, self._status, entrances)
             title = focus.name
             kind = "cave"
+        elif context.semantic == "cave_interior" and focus:
+            settings.width = max(settings.width, 1200)
+            settings.height = max(settings.height, 860)
+            generator = DeepCaveGenerator(focus, settings, self.state.config, self.assets, self._status)
+            title = f"{focus.name} · Deep Cavern"
+            kind = "cavern"
+        elif context.semantic == "dragon_lair" and focus:
+            settings.width = max(settings.width, 1250)
+            settings.height = max(settings.height, 900)
+            generator = DragonLairGenerator(focus, settings, self.state.config, self.assets, self._status, entrances)
+            title = focus.name
+            kind = "dragon_lair"
+        elif context.semantic == "bandit_camp" and focus:
+            settings.width = max(settings.width, 1100)
+            settings.height = max(settings.height, 800)
+            generator = BanditCampGenerator(focus, settings, self.state.config, self.assets, self._status, entrances)
+            title = focus.name
+            kind = "bandit_camp"
+        elif context.semantic == "fort" and focus:
+            settings.width = max(settings.width, 1050)
+            settings.height = max(settings.height, 760)
+            generator = FortGenerator(focus, settings, self.state.config, self.assets, self._status, entrances)
+            title = focus.name
+            kind = "fort"
+        elif context.semantic == "ruined_city" and focus:
+            settings.width = max(settings.width, 1200)
+            settings.height = max(settings.height, 850)
+            generator = RuinedCityGenerator(focus, settings, self.state.config, self.assets, self._status, entrances)
+            title = focus.name
+            kind = "region"
         elif context.semantic == "building" and focus:
+            floor_count = max(1, int(focus.metadata.get("floor_count", 1)))
+            if floor_count > 1 and focus.kind != "floor":
+                generator = BuildingSectionGenerator(focus, 1100, 820, seed, self.state.config, self.assets, self._status)
+                title = f"{focus.name} · Floors"
+                kind = "building_section"
+            else:
+                generator = BuildingInteriorGenerator(focus, 1200, 900, seed, self.state.config, self.assets, self._status)
+                title = f"{focus.name} · Interior"
+                kind = "building"
+        elif context.semantic == "floor" and focus:
             generator = BuildingInteriorGenerator(focus, 1200, 900, seed, self.state.config, self.assets, self._status)
             title = f"{focus.name} · Interior"
-            kind = "building"
+            kind = "floor"
         elif context.semantic == "room" and focus:
-            generator = RoomGenerator(focus, 1000, 760, seed, self.state.config, self.assets, self._status)
+            rw, rh = rect_aspect_dimensions((0, 0, max(1, int(focus.width)), max(1, int(focus.height))), 1100, 820, minimum=560)
+            generator = RoomGenerator(focus, rw, rh, seed, self.state.config, self.assets, self._status)
             title = focus.name
             kind = "room"
         elif context.semantic == "road":
@@ -592,6 +808,7 @@ class CampaignForgeApp:
         self._refresh_tree()
         self.fit_view()
         self._status(f"Complete · {scene.kind} · {scene.biome}", 1.0)
+        self._schedule_autosave()
 
     def _link_entity_child(self, entity_id: str, child_scene_id: str) -> None:
         world_ref = None
@@ -660,6 +877,8 @@ class CampaignForgeApp:
                 self._place_npc(value, x, y)
             elif kind == "asset":
                 self._place_asset(value, x, y)
+            elif kind == "object":
+                self._place_object(value, x, y)
             self.pending_place = None
             self.canvas.configure(cursor="crosshair")
             return
@@ -702,9 +921,13 @@ class CampaignForgeApp:
         if not scene:
             return
         if self.entity_drag_id:
+            entity = next((e for e in scene.entities if e.id == self.entity_drag_id), None)
+            if entity:
+                entity.x, entity.y = self._snap_point(entity.x, entity.y, scene)
             self.entity_drag_id = None
             self._sync_transform_controls()
             self.render()
+            self._schedule_autosave()
             return
         if not self.drag_start:
             return
@@ -718,8 +941,9 @@ class CampaignForgeApp:
         if bx - ax < 18 or by - ay < 18:
             self.selection = None
         else:
-            self.selection = (int(ax), int(ay), int(bx), int(by))
+            self.selection = self._normalize_generation_rect(scene, (int(ax), int(ay), int(bx), int(by)))
             context = resolve_selection(scene, self.selection)
+            ax, ay, bx, by = self.selection
             max_w, max_h = self.DETAIL_PRESETS[self.detail_preset.get()]
             out_w, out_h = rect_aspect_dimensions(self.selection, max_w, max_h, minimum=520)
             self.status_var.set(f"Selected {int(bx-ax)}×{int(by-ay)} · {context.semantic}/{context.biome} · output {out_w}×{out_h} with aspect preserved")
@@ -751,7 +975,7 @@ class CampaignForgeApp:
             self.render()
             return
         context = context_for_entity(scene, entity)
-        if context.semantic not in {"town", "castle", "mage_tower", "cave", "building", "room", "ocean", "terrain"}:
+        if context.semantic not in {"town", "castle", "fort", "mage_tower", "cave", "cave_interior", "dragon_lair", "bandit_camp", "ruined_city", "building", "floor", "room", "ocean", "terrain"}:
             return
         self._generate_context(scene, context, self._entity_rect(scene, entity))
 
@@ -779,10 +1003,28 @@ class CampaignForgeApp:
         return best
 
     def _selection_for(self, scene: Scene) -> Optional[tuple[int, int, int, int]]:
-        if self.selection:
-            x1, y1, x2, y2 = self.selection
-            return max(0,x1), max(0,y1), min(scene.image.width,x2), min(scene.image.height,y2)
-        return None
+        if not self.selection:
+            return None
+        x1, y1, x2, y2 = self.selection
+        rect = (max(0, x1), max(0, y1), min(scene.image.width, x2), min(scene.image.height, y2))
+        return self._normalize_generation_rect(scene, rect)
+
+    def _normalize_generation_rect(self, scene: Scene, rect: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+        """Keep detail selections useful without stretching or dropping selected locations."""
+        x1, y1, x2, y2 = rect
+        w = max(1, x2 - x1); h = max(1, y2 - y1)
+        cx = (x1 + x2) / 2; cy = (y1 + y2) / 2
+        max_ratio = 2.65
+        if w / h > max_ratio:
+            h = min(scene.image.height, int(round(w / max_ratio)))
+        elif h / w > max_ratio:
+            w = min(scene.image.width, int(round(h / max_ratio)))
+        max_w = max(240, int(scene.image.width * .82))
+        max_h = max(240, int(scene.image.height * .82))
+        w = min(w, max_w); h = min(h, max_h)
+        nx1 = int(round(cx - w / 2)); ny1 = int(round(cy - h / 2))
+        nx1 = max(0, min(scene.image.width - w, nx1)); ny1 = max(0, min(scene.image.height - h, ny1))
+        return (int(nx1), int(ny1), int(nx1 + w), int(ny1 + h))
 
     def _wheel(self, event) -> str:
         if event.state & 0x0004:
@@ -943,9 +1185,11 @@ class CampaignForgeApp:
         if scene_id is None:
             self._base_render_cache.clear()
             self._scaled_render_cache.clear()
+            self._experimental_cache.clear()
             return
         self._base_render_cache = {k: v for k, v in self._base_render_cache.items() if not k or k[0] != scene_id}
         self._scaled_render_cache = {k: v for k, v in self._scaled_render_cache.items() if not k or k[0] != scene_id}
+        self._experimental_cache = {k: v for k, v in self._experimental_cache.items() if not k or k[0] != scene_id}
 
     def _schedule_quality_render(self) -> None:
         if self._quality_after_id:
@@ -965,6 +1209,16 @@ class CampaignForgeApp:
     def _base_image_for_scene(self, scene: Scene) -> Image.Image:
         if scene.kind == "preview":
             return scene.image
+        experimental = self.view_mode.get() == "Experimental 2.5D"
+        if experimental:
+            exp_key = (scene.id, id(scene.image), round(float(self.camera_tilt.get()),1), round(float(self.camera_rotation.get()),1), round(float(self.camera_height.get()),2))
+            image = self._experimental_cache.get(exp_key)
+            if image is None:
+                image = render_experimental(scene, self.camera_tilt.get(), self.camera_rotation.get(), self.camera_height.get())
+                if len(self._experimental_cache) > 8:
+                    for stale in list(self._experimental_cache)[:3]: self._experimental_cache.pop(stale, None)
+                self._experimental_cache[exp_key] = image
+            return self._grid_overlay(image)
         key = (scene.id, id(scene.image), self.grid_type.get(), int(self.grid_size.get()))
         cached = self._base_render_cache.get(key)
         if cached is not None:
@@ -987,7 +1241,8 @@ class CampaignForgeApp:
         image = self._base_image_for_scene(scene)
         size = (max(1, int(image.width * self.zoom)), max(1, int(image.height * self.zoom)))
         zoom_key = round(self.zoom, 4)
-        key = (scene.id, id(scene.image), self.grid_type.get() if scene.kind != "preview" else "preview", int(self.grid_size.get()) if scene.kind != "preview" else 0, zoom_key, bool(fast))
+        view_key = (self.view_mode.get(), round(float(self.camera_tilt.get()),1), round(float(self.camera_rotation.get()),1), round(float(self.camera_height.get()),2)) if scene.kind != "preview" else ("preview",)
+        key = (scene.id, id(scene.image), self.grid_type.get() if scene.kind != "preview" else "preview", int(self.grid_size.get()) if scene.kind != "preview" else 0, zoom_key, bool(fast), view_key)
         preview = self._scaled_render_cache.get(key)
         if preview is None:
             resample = Image.Resampling.BILINEAR if fast else Image.Resampling.LANCZOS
@@ -1004,7 +1259,7 @@ class CampaignForgeApp:
         self.canvas.create_image(0, 0, image=self.photo, anchor="nw", tags="map")
         self.canvas.configure(scrollregion=(0, 0, size[0], size[1]))
         self.overlay_photos.clear()
-        if draw_overlays:
+        if draw_overlays and self.view_mode.get() == "Normal 2D":
             self._draw_child_portals(scene)
             self._draw_dynamic_entities(scene)
             if self.selection:
@@ -1037,8 +1292,21 @@ class CampaignForgeApp:
                     continue
                 r = max(4, int(entity.width * self.zoom / 2))
                 x, y = entity.x * self.zoom, entity.y * self.zoom
-                color = self.NPC_COLORS.get(entity.name, self.NPC_COLORS.get(entity.subtype.title(), "#d3a35d"))
-                self.canvas.create_oval(x-r, y-r, x+r, y+r, fill=color, outline="#1a1c20", width=2, tags=("entity", entity.id))
+                npc_asset = self.assets.slots.get("npc.default")
+                sprite = self.assets.get_scaled(npc_asset, max(8,int(entity.width*self.zoom)), max(8,int(entity.height*self.zoom)), int(entity.metadata.get("rotation",0)), bool(entity.metadata.get("flip_h",False)), bool(entity.metadata.get("flip_v",False))) if npc_asset else None
+                if sprite:
+                    photo=ImageTk.PhotoImage(sprite); self.overlay_photos.append(photo)
+                    self.canvas.create_image(x,y,image=photo,anchor="center",tags=("entity",entity.id))
+                    r=max(sprite.width,sprite.height)//2
+                else:
+                    color = self.NPC_COLORS.get(entity.name, self.NPC_COLORS.get(entity.subtype.replace("_"," ").title(), "#d3a35d"))
+                    if entity.subtype == "dragon":
+                        rw=max(18,int(entity.width*self.zoom/2)); rh=max(12,int(entity.height*self.zoom/2))
+                        self.canvas.create_polygon(x-rw*.3,y, x-rw,y-rh*.75, x-rw*.55,y+rh*.15, x-rw*.9,y+rh*.75, x,y+rh*.3, x+rw*.9,y+rh*.75, x+rw*.55,y+rh*.15, x+rw,y-rh*.75, x+rw*.3,y, fill="#8f3f38",outline="#311f1d",width=2,tags=("entity",entity.id))
+                        self.canvas.create_oval(x-rw*.42,y-rh*.35,x+rw*.42,y+rh*.35,fill=color,outline="#311f1d",width=2,tags=("entity",entity.id))
+                        r=max(rw,rh)
+                    else:
+                        self.canvas.create_oval(x-r, y-r, x+r, y+r, fill=color, outline="#1a1c20", width=2, tags=("entity", entity.id))
                 if self.zoom > .75:
                     self.canvas.create_text(x, y+r+8, text=entity.name, fill="#f1f3f7", font=("Segoe UI", 8), tags=("entity", entity.id))
             elif entity.kind == "custom" and entity.asset_id:
@@ -1056,6 +1324,11 @@ class CampaignForgeApp:
                     photo = ImageTk.PhotoImage(sprite)
                     self.overlay_photos.append(photo)
                     self.canvas.create_image(entity.x*self.zoom, entity.y*self.zoom, image=photo, anchor="center", tags=("entity", entity.id))
+            elif entity.kind == "object":
+                if self.zoom >= .42 or entity.id == self.selected_entity_id:
+                    self._draw_object_canvas(entity)
+            elif entity.kind == "building" and self.assets.slots.get(self._entity_asset_slot(entity) or "") and self.zoom >= .35:
+                self._draw_semantic_marker_canvas(entity)
             elif self.zoom >= 1.25 and entity.kind in {"settlement", "landmark"}:
                 self._draw_semantic_marker_canvas(entity)
             elif self.zoom >= 1.75 and entity.kind == "building" and scene.kind in {"town", "castle", "mage_tower", "region"}:
@@ -1069,6 +1342,17 @@ class CampaignForgeApp:
 
     def _draw_semantic_marker_canvas(self, entity: Entity) -> None:
         x, y = entity.x*self.zoom, entity.y*self.zoom
+        slot = self._entity_asset_slot(entity)
+        aid = self.assets.slots.get(slot) if slot else None
+        if aid:
+            tw=max(8,int(entity.width*self.zoom)); th=max(8,int(entity.height*self.zoom))
+            sprite=self.assets.get_scaled(aid,tw,th)
+            if sprite:
+                photo=ImageTk.PhotoImage(sprite); self.overlay_photos.append(photo)
+                self.canvas.create_image(x,y,image=photo,anchor="center",tags=("entity",entity.id))
+                if self.zoom >= 1.65 and entity.name:
+                    self.canvas.create_text(x,y+th/2+8,text=entity.name,fill="#f0eadc",font=("Segoe UI",8,"bold"),tags=("entity",entity.id))
+                return
         scale = max(.8, min(2.2, self.zoom))
         kind = entity.subtype
         ink = "#302820"
@@ -1130,11 +1414,15 @@ class CampaignForgeApp:
     def _place_npc(self, name: str, x: float, y: float) -> None:
         scene=self.current_scene()
         if not scene:return
-        entity = Entity(str(uuid.uuid4()), "npc", name.lower(), name, x, y, 28, 28, movable=True, metadata={"biome": scene.sample_biome(x, y), "manual": True, "initial_width": 28, "initial_height": 28, "rotation": 0, "flip_h": False, "flip_v": False, "keep_aspect": True})
+        x, y = self._snap_point(x, y, scene)
+        sizes = {"Wolf": (34,28), "Giant Spider": (44,36), "Dragon": (120,84), "Orc": (34,34), "Goblin": (24,24), "Skeleton": (28,28)}
+        w, h = sizes.get(name, (28,28))
+        entity = Entity(str(uuid.uuid4()), "npc", name.lower().replace(" ", "_"), name, x, y, w, h, movable=True, metadata={"biome": scene.sample_biome(x, y), "manual": True, "large_creature": name in {"Dragon", "Giant Spider"}, "initial_width": w, "initial_height": h, "rotation": 0, "flip_h": False, "flip_v": False, "keep_aspect": True})
         scene.entities.append(entity)
         self.selected_entity_id = entity.id
         self._sync_transform_controls()
         self.render()
+        self._schedule_autosave()
 
     def import_png(self) -> None:
         path=filedialog.askopenfilename(filetypes=[("PNG image","*.png")])
@@ -1212,6 +1500,7 @@ class CampaignForgeApp:
         img = self.assets.get(aid)
         if not scene or not img:
             return
+        x, y = self._snap_point(x, y, scene)
         scale = min(1.0, 96 / max(img.width, img.height))
         w = max(24, img.width * scale)
         h = max(24, img.height * scale)
@@ -1233,6 +1522,7 @@ class CampaignForgeApp:
         self.selected_entity_id = entity.id
         self._sync_transform_controls()
         self.render()
+        self._schedule_autosave()
 
     def _texture_slot_changed(self, _event=None) -> None:
         aid = self.assets.slots.get(self.texture_slot.get())
@@ -1249,6 +1539,41 @@ class CampaignForgeApp:
         slot = self.texture_slot.get()
         self.assets.assign(slot, aid)
         self.texture_status.configure(text=f"{slot} → {self.assets.assets[aid].name}")
+        self._invalidate_render_cache()
+        self.render()
+        self._schedule_autosave()
+
+    def _refresh_object_palette(self) -> None:
+        if not hasattr(self, "object_list"):
+            return
+        self.object_list.delete(0, tk.END)
+        for name in self.OBJECT_CATEGORIES.get(self.object_category.get(), []):
+            self.object_list.insert(tk.END, name)
+
+    def arm_selected_object(self) -> None:
+        if not hasattr(self, "object_list"):
+            return
+        sel = self.object_list.curselection()
+        if not sel:
+            return
+        self._arm_place("object", self.object_list.get(sel[0]))
+
+    def _place_object(self, name: str, x: float, y: float) -> None:
+        scene = self.current_scene()
+        if not scene:
+            return
+        subtype = name.lower().replace(" ", "_")
+        x, y = self._snap_point(x, y, scene)
+        w, h = self.OBJECT_SIZES.get(subtype, (34, 30))
+        entity = Entity(
+            str(uuid.uuid4()), "object", subtype, name, x, y, w, h, movable=True,
+            metadata={"biome": scene.sample_biome(x, y), "manual": True, "rotation": 0, "flip_h": False, "flip_v": False, "initial_width": w, "initial_height": h, "keep_aspect": True},
+        )
+        scene.entities.append(entity)
+        self.selected_entity_id = entity.id
+        self._sync_transform_controls()
+        self.render()
+        self._schedule_autosave()
 
     def _selected_movable(self) -> Optional[Entity]:
         scene = self.current_scene()
@@ -1279,6 +1604,7 @@ class CampaignForgeApp:
         entity.metadata["keep_aspect"] = True
         self._sync_transform_controls()
         self.render()
+        self._schedule_autosave()
 
     def apply_transform_size(self) -> None:
         scene = self.current_scene()
@@ -1299,6 +1625,7 @@ class CampaignForgeApp:
         entity.metadata["keep_aspect"] = keep
         self._sync_transform_controls()
         self.render()
+        self._schedule_autosave()
 
     def rotate_selected(self, degrees: int) -> None:
         entity = self._selected_movable()
@@ -1307,6 +1634,7 @@ class CampaignForgeApp:
         entity.metadata["rotation"] = (int(entity.metadata.get("rotation", 0)) + int(degrees)) % 360
         self._sync_transform_controls()
         self.render()
+        self._schedule_autosave()
 
     def flip_selected(self, axis: str) -> None:
         entity = self._selected_movable()
@@ -1316,6 +1644,7 @@ class CampaignForgeApp:
         entity.metadata[key] = not bool(entity.metadata.get(key, False))
         self._sync_transform_controls()
         self.render()
+        self._schedule_autosave()
 
     def reset_selected_transform(self) -> None:
         entity = self._selected_movable()
@@ -1329,6 +1658,7 @@ class CampaignForgeApp:
         entity.metadata["keep_aspect"] = True
         self._sync_transform_controls()
         self.render()
+        self._schedule_autosave()
 
     def _resize_entity_wheel(self, event) -> str:
         scene = self.current_scene()
@@ -1349,6 +1679,7 @@ class CampaignForgeApp:
         self.selected_entity_id = None
         self._sync_transform_controls()
         self.render()
+        self._schedule_autosave()
 
     def _refresh_tree(self) -> None:
         self.scene_tree.delete(*self.scene_tree.get_children())
@@ -1376,7 +1707,7 @@ class CampaignForgeApp:
         if not self.state.scenes:return
         path=filedialog.asksaveasfilename(defaultextension=".cforge",filetypes=[("CampaignForge project","*.cforge")],initialfile="campaign.cforge")
         if not path:return
-        try:save_campaign(path,self.state,self.assets);self.status_var.set(f"Saved project: {Path(path).name}")
+        try:self._capture_view_state();save_campaign(path,self.state,self.assets);self.status_var.set(f"Saved project: {Path(path).name}")
         except Exception as exc:messagebox.showerror("Save failed",str(exc))
 
     def open_project(self) -> None:
@@ -1384,17 +1715,16 @@ class CampaignForgeApp:
         if not path:return
         try:
             state,assets,tmp=load_campaign(path)
-            self.state=state;self.assets=assets;self.project_extract_dir=tmp
-            self._invalidate_render_cache()
-            for key,var in self.rule_vars.items():var.set(getattr(self.state.config,key))
-            self._refresh_assets();self.selection=None;self.selected_entity_id=None;self._refresh_tree();self.fit_view();self.status_var.set(f"Opened {Path(path).name}")
+            self._apply_loaded_project(state, assets, tmp)
+            self.current_local_save = None
+            self.status_var.set(f"Opened {Path(path).name}")
         except Exception as exc:messagebox.showerror("Open failed",str(exc))
 
     def rename_scene(self) -> None:
         scene=self.current_scene()
         if not scene:return
         name=simpledialog.askstring("Rename scene","Scene name:",initialvalue=scene.title,parent=self.root)
-        if name and name.strip():scene.title=name.strip();self._refresh_tree();self.render()
+        if name and name.strip():scene.title=name.strip();self._refresh_tree();self.render();self._schedule_autosave()
 
     def delete_selected_scene(self) -> None:
         selected = self.scene_tree.selection()
@@ -1421,6 +1751,7 @@ class CampaignForgeApp:
         else:
             self.render()
         self.status_var.set(f"Deleted {len(removed)} generated area(s); parent content was preserved")
+        self._schedule_autosave()
 
     def export_png(self) -> None:
         scene=self.current_scene()
@@ -1447,7 +1778,12 @@ class CampaignForgeApp:
         out=self._grid_overlay(scene.image).convert("RGBA");d=ImageDraw.Draw(out,"RGBA")
         for e in scene.entities:
             if e.kind=="npc":
-                r=max(5,int(e.width/2));color=self.NPC_COLORS.get(e.name,self.NPC_COLORS.get(e.subtype.title(),"#d3a35d"));rgb=self.root.winfo_rgb(color);fill=tuple(v//256 for v in rgb)+(255,);d.ellipse((e.x-r,e.y-r,e.x+r,e.y+r),fill=fill,outline=(25,27,31,255),width=2)
+                npc_asset=self.assets.slots.get("npc.default")
+                sprite=self.assets.get_scaled(npc_asset,max(1,int(e.width)),max(1,int(e.height)),int(e.metadata.get("rotation",0)),bool(e.metadata.get("flip_h",False)),bool(e.metadata.get("flip_v",False))) if npc_asset else None
+                if sprite:
+                    out.alpha_composite(sprite,(int(e.x-sprite.width/2),int(e.y-sprite.height/2)))
+                else:
+                    r=max(5,int(e.width/2));color=self.NPC_COLORS.get(e.name,self.NPC_COLORS.get(e.subtype.title(),"#d3a35d"));rgb=self.root.winfo_rgb(color);fill=tuple(v//256 for v in rgb)+(255,);d.ellipse((e.x-r,e.y-r,e.x+r,e.y+r),fill=fill,outline=(25,27,31,255),width=2)
             elif e.kind=="custom" and e.asset_id:
                 sprite = self.assets.get_scaled(
                     e.asset_id,
@@ -1459,7 +1795,406 @@ class CampaignForgeApp:
                 )
                 if sprite:
                     out.alpha_composite(sprite, (int(e.x-sprite.width/2), int(e.y-sprite.height/2)))
+            elif e.kind=="object":
+                slot=self._entity_asset_slot(e); aid=self.assets.slots.get(slot) if slot else None
+                sprite=self.assets.get_scaled(aid,max(1,int(e.width)),max(1,int(e.height)),int(e.metadata.get("rotation",0))) if aid else None
+                if sprite:
+                    out.alpha_composite(sprite,(int(e.x-sprite.width/2),int(e.y-sprite.height/2)))
+                else:
+                    self._draw_object_pil(d,e)
         return out.convert("RGB")
+
+
+    def _startup_project(self) -> None:
+        path = autosave_path()
+        if path.exists():
+            try:
+                if messagebox.askyesno("Continue campaign", f"A local autosave was found. Continue where you left off?\n\n{path}", parent=self.root):
+                    state, assets, tmp = load_campaign(str(path))
+                    self._apply_loaded_project(state, assets, tmp)
+                    self.current_local_save = path
+                    self.status_var.set("Continued from local autosave")
+                    return
+            except Exception as exc:
+                self.status_var.set(f"Autosave could not be opened: {exc}")
+        self.new_world()
+
+    def _capture_view_state(self) -> None:
+        selection = list(self.selection) if self.selection else None
+        self.state.view_state = {
+            "zoom": round(float(self.zoom), 5),
+            "xview": float(self.canvas.xview()[0]) if self.state.scenes else 0.0,
+            "yview": float(self.canvas.yview()[0]) if self.state.scenes else 0.0,
+            "grid_type": self.grid_type.get() if hasattr(self, "grid_type") else "None",
+            "grid_size": int(self.grid_size.get()) if hasattr(self, "grid_size") else 48,
+            "selection": selection,
+            "view_mode": self.view_mode.get(),
+            "camera_tilt": round(float(self.camera_tilt.get()), 2),
+            "camera_rotation": round(float(self.camera_rotation.get()), 2),
+            "camera_height": round(float(self.camera_height.get()), 3),
+        }
+
+    def _restore_view_state(self) -> None:
+        view = self.state.view_state or {}
+        grid_type = view.get("grid_type", "None")
+        if grid_type in {"None", "Square", "Hex"}:
+            self.grid_type.set(grid_type)
+            if grid_type != "None":
+                self.last_grid_type = grid_type
+        try:
+            self.grid_size.set(max(12, min(200, int(view.get("grid_size", self.grid_size.get())))))
+        except (TypeError, ValueError, tk.TclError):
+            pass
+        try:
+            self.zoom = max(.08, min(6.0, float(view.get("zoom", 1.0))))
+        except (TypeError, ValueError):
+            self.zoom = 1.0
+        mode = view.get("view_mode", "Normal 2D")
+        self.view_mode.set(mode if mode in {"Normal 2D", "Experimental 2.5D"} else "Normal 2D")
+        try:
+            self.camera_tilt.set(float(view.get("camera_tilt", 48.0)))
+            self.camera_rotation.set(float(view.get("camera_rotation", 28.0)))
+            self.camera_height.set(float(view.get("camera_height", 1.0)))
+        except (TypeError, ValueError, tk.TclError):
+            pass
+        if hasattr(self, "view_toggle_btn"):
+            self.view_toggle_btn.configure(text="View: 2.5D" if self.view_mode.get().startswith("Experimental") else "View: 2D")
+        raw_selection = view.get("selection")
+        self.selection = tuple(int(v) for v in raw_selection) if isinstance(raw_selection, (list, tuple)) and len(raw_selection) == 4 else None
+        self._grid_type_changed(render_now=False)
+        self.render()
+        def move_view() -> None:
+            try:
+                self.canvas.xview_moveto(max(0.0, min(1.0, float(view.get("xview", 0.0)))))
+                self.canvas.yview_moveto(max(0.0, min(1.0, float(view.get("yview", 0.0)))))
+            except (TypeError, ValueError, tk.TclError):
+                pass
+        self.root.after_idle(move_view)
+
+    def _apply_loaded_project(self, state: CampaignState, assets: AssetLibrary, extraction: str) -> None:
+        self.state = state
+        self.assets = assets
+        self.project_extract_dir = extraction
+        self._invalidate_render_cache()
+        for key, var in self.rule_vars.items():
+            var.set(getattr(self.state.config, key))
+        self.temperature_var.set(self.state.config.temperature)
+        self.altitude_var.set(self.state.config.max_altitude)
+        self.moisture_var.set(self.state.config.moisture)
+        self.road_min_var.set(self.state.config.road_min_per_settlement)
+        self.road_max_var.set(self.state.config.road_max_per_settlement)
+        self.road_chance_var.set(self.state.config.road_connection_chance)
+        self.ruin_chance_var.set(self.state.config.rare_ruin_chance)
+        self.snap_grid_var.set(self.state.config.snap_to_grid)
+        self.smooth_terrain_var.set(self.state.config.experimental_smooth_terrain)
+        self._refresh_assets()
+        self.selected_entity_id = None
+        self._refresh_tree()
+        self._restore_view_state()
+        self._refresh_local_saves()
+
+    def _refresh_local_saves(self) -> None:
+        if not hasattr(self, "local_save_box"):
+            return
+        items = list_local_saves()
+        self._local_save_items = {item.display: item.path for item in items}
+        values = list(self._local_save_items)
+        self.local_save_box.configure(values=values)
+        if values:
+            current = self.local_save_choice.get()
+            if current not in self._local_save_items:
+                self.local_save_choice.set(values[0])
+        else:
+            self.local_save_choice.set("")
+        if hasattr(self, "local_save_status"):
+            self.local_save_status.configure(text=f"Folder: {saves_directory()}")
+
+    def quick_save_local(self) -> None:
+        if not self.state.scenes:
+            return
+        self._capture_view_state()
+        target = self.current_local_save if self.current_local_save and self.current_local_save.exists() and self.current_local_save.name != "autosave.cforge" else autosave_path()
+        try:
+            save_campaign(str(target), self.state, self.assets)
+            self.current_local_save = target
+            self.status_var.set(f"Quick saved locally: {target.name}")
+            self._refresh_local_saves()
+        except Exception as exc:
+            messagebox.showerror("Quick save failed", str(exc))
+
+    def save_local_as(self) -> None:
+        if not self.state.scenes:
+            return
+        default = self.state.title if self.state.title and self.state.title != "Untitled Campaign" else "My Campaign"
+        name = simpledialog.askstring("Local save", "Save name:", initialvalue=default, parent=self.root)
+        if not name:
+            return
+        target = save_path(clean_save_name(name))
+        if target.exists() and not messagebox.askyesno("Replace save", f"Replace existing local save '{target.stem}'?", parent=self.root):
+            return
+        self.state.title = clean_save_name(name)
+        self._capture_view_state()
+        try:
+            save_campaign(str(target), self.state, self.assets)
+            self.current_local_save = target
+            self.status_var.set(f"Saved locally: {target.name}")
+            self._refresh_local_saves()
+        except Exception as exc:
+            messagebox.showerror("Local save failed", str(exc))
+
+    def load_selected_local(self) -> None:
+        display = self.local_save_choice.get()
+        target = self._local_save_items.get(display)
+        if not target:
+            return
+        try:
+            state, assets, tmp = load_campaign(str(target))
+            self._apply_loaded_project(state, assets, tmp)
+            self.current_local_save = target
+            self.status_var.set(f"Loaded local save: {target.name}")
+        except Exception as exc:
+            messagebox.showerror("Load failed", str(exc))
+
+    def delete_selected_local_save(self) -> None:
+        display = self.local_save_choice.get()
+        target = self._local_save_items.get(display)
+        if not target:
+            return
+        if not messagebox.askyesno("Delete local save", f"Delete '{target.stem}'?", parent=self.root):
+            return
+        try:
+            target.unlink(missing_ok=True)
+            if self.current_local_save == target:
+                self.current_local_save = None
+            self._refresh_local_saves()
+            self.status_var.set(f"Deleted local save: {target.name}")
+        except OSError as exc:
+            messagebox.showerror("Delete failed", str(exc))
+
+    def _schedule_autosave(self) -> None:
+        if not self.state.scenes:
+            return
+        if self._autosave_after_id:
+            try:
+                self.root.after_cancel(self._autosave_after_id)
+            except tk.TclError:
+                pass
+        self._autosave_after_id = self.root.after(1800, self._autosave_now)
+
+    def _autosave_now(self) -> None:
+        self._autosave_after_id = None
+        if not self.state.scenes or self.running:
+            return
+        self._capture_view_state()
+        try:
+            save_campaign(str(autosave_path()), self.state, self.assets)
+            self._refresh_local_saves()
+        except Exception:
+            pass
+
+    def _on_close(self) -> None:
+        if self.state.scenes and not self.running:
+            self._autosave_now()
+        self.root.destroy()
+
+    def _grid_type_changed(self, _event=None, render_now: bool = True) -> None:
+        kind = self.grid_type.get()
+        if kind not in {"None", "Square", "Hex"}:
+            kind = "None"
+            self.grid_type.set(kind)
+        if kind != "None":
+            self.last_grid_type = kind
+            if self.state.config.snap_to_grid:
+                self._snap_all_movable_to_grid()
+        if hasattr(self, "quick_grid_btn"):
+            self.quick_grid_btn.configure(text=f"Grid: {kind if kind != 'None' else 'Off'}")
+        self._sync_config()
+        self._invalidate_render_cache()
+        if render_now:
+            self.render()
+
+    def toggle_grid_quick(self) -> None:
+        if self.grid_type.get() == "None":
+            self.grid_type.set(self.last_grid_type if self.last_grid_type in {"Square", "Hex"} else "Square")
+        else:
+            self.last_grid_type = self.grid_type.get()
+            self.grid_type.set("None")
+        self._grid_type_changed()
+
+    def _snap_point(self, x: float, y: float, scene: Scene) -> tuple[float, float]:
+        if not self.state.config.snap_to_grid or self.grid_type.get() == "None":
+            return max(0.0, min(scene.image.width, x)), max(0.0, min(scene.image.height, y))
+        return grid_snap_point(x, y, self.grid_type.get(), float(self.grid_size.get()), scene.image.width, scene.image.height)
+
+    def _side_zoom_in(self, event) -> str | None:
+        return self._side_zoom(event, 1.16)
+
+    def _side_zoom_out(self, event) -> str | None:
+        return self._side_zoom(event, .86)
+
+    def _side_zoom(self, event, factor: float) -> str | None:
+        if not hasattr(self, "canvas") or not self.current_scene():
+            return None
+        px, py = self.root.winfo_pointerx(), self.root.winfo_pointery()
+        rx, ry = self.canvas.winfo_rootx(), self.canvas.winfo_rooty()
+        over_map = rx <= px <= rx + self.canvas.winfo_width() and ry <= py <= ry + self.canvas.winfo_height()
+        if not over_map:
+            return None
+        self.change_zoom(factor, int(px-rx), int(py-ry))
+        return "break"
+
+    def _view_mode_changed(self) -> None:
+        self._invalidate_render_cache()
+        if hasattr(self, "view_toggle_btn"):
+            self.view_toggle_btn.configure(text="View: 2.5D" if self.view_mode.get().startswith("Experimental") else "View: 2D")
+        self.render()
+        self._schedule_autosave()
+
+    def toggle_view_mode(self) -> None:
+        self.view_mode.set("Normal 2D" if self.view_mode.get().startswith("Experimental") else "Experimental 2.5D")
+        self._view_mode_changed()
+
+    def _experimental_camera_changed(self) -> None:
+        if self.view_mode.get() != "Experimental 2.5D":
+            return
+        self._experimental_cache.clear()
+        self.render(fast=True)
+        self._schedule_quality_render()
+
+    def reset_experimental_camera(self) -> None:
+        self.camera_tilt.set(48.0); self.camera_rotation.set(28.0); self.camera_height.set(1.0)
+        self._experimental_cache.clear()
+        self.render()
+
+    def _snap_setting_changed(self) -> None:
+        self._sync_config()
+        if self.state.config.snap_to_grid and self.grid_type.get() != "None":
+            self._snap_all_movable_to_grid()
+        self.render()
+        self._schedule_autosave()
+
+    def _snap_all_movable_to_grid(self) -> None:
+        scene = self.current_scene()
+        if not scene or self.grid_type.get() == "None":
+            return
+        cell = max(12.0, float(self.grid_size.get()))
+        for entity in scene.entities:
+            if not entity.movable:
+                continue
+            entity.x, entity.y = grid_snap_point(entity.x, entity.y, self.grid_type.get(), cell, scene.image.width, scene.image.height)
+            entity.metadata["grid_footprint"] = [max(1, math.ceil(entity.width / cell)), max(1, math.ceil(entity.height / cell))]
+
+    def _entity_asset_slot(self, entity: Entity) -> Optional[str]:
+        if entity.kind == "npc":
+            return "npc.default"
+        if entity.kind == "building":
+            subtype = entity.subtype
+            if subtype in {"house", "cottage", "farmhouse", "noble_house"}: return "building.house"
+            if subtype in {"tavern", "inn"}: return "building.tavern"
+            if subtype == "blacksmith": return "building.blacksmith"
+            if subtype == "temple": return "building.temple"
+            if subtype in {"shop", "apothecary", "bakery", "mage_shop"}: return "building.shop"
+        if entity.kind == "object":
+            subtype = entity.subtype.replace(" ", "_")
+            direct = {
+                "table":"furniture.table", "chair":"furniture.chair", "bed":"furniture.bed", "chest":"furniture.chest",
+                "shelf":"furniture.shelf", "bookshelf":"furniture.shelf", "wardrobe":"furniture.wardrobe", "lamp":"furniture.lamp",
+                "desk":"furniture.desk", "cabinet":"furniture.cabinet", "rug":"furniture.rug", "fireplace":"furniture.fireplace",
+                "barrel":"object.barrel", "crate":"object.crate", "plant":"object.plant", "weapon_rack":"object.weapon_rack",
+                "cart":"object.cart", "boat":"object.boat", "bench":"object.bench", "road_sign":"object.sign",
+                "sign":"object.sign", "market_stall":"object.market_stall", "well":"object.well", "statue":"object.statue",
+                "fence":"object.fence", "treasure":"object.treasure", "campfire":"object.campfire"}
+            return direct.get(subtype)
+        return None
+
+    def _draw_object_canvas(self, entity: Entity) -> None:
+        x, y = entity.x*self.zoom, entity.y*self.zoom
+        w, h = max(5, entity.width*self.zoom), max(5, entity.height*self.zoom)
+        rotation = int(entity.metadata.get("rotation", 0)) % 360
+        if rotation in {90, 270}:
+            w, h = h, w
+        slot = self._entity_asset_slot(entity)
+        aid = self.assets.slots.get(slot) if slot else None
+        if aid:
+            sprite = self.assets.get_scaled(aid, max(2,int(w)), max(2,int(h)), int(entity.metadata.get("rotation",0)), bool(entity.metadata.get("flip_h",False)), bool(entity.metadata.get("flip_v",False)))
+            if sprite:
+                ph = ImageTk.PhotoImage(sprite); self.overlay_photos.append(ph)
+                self.canvas.create_image(x,y,image=ph,anchor="center",tags=("entity",entity.id)); return
+        s = entity.subtype.replace(" ", "_")
+        tag=("entity",entity.id); ink="#32291f"; wood="#775535"; cloth="#8d7052"; metal="#6d7275"
+        if s in {"table","desk","counter","workbench"}:
+            self.canvas.create_rectangle(x-w/2,y-h/2,x+w/2,y+h/2,fill=wood,outline=ink,width=2,tags=tag)
+            if s=="desk": self.canvas.create_line(x-w*.25,y,x+w*.25,y,fill="#c7aa76",tags=tag)
+        elif s in {"chair","bench","pew"}:
+            self.canvas.create_rectangle(x-w/2,y-h/3,x+w/2,y+h/2,fill="#8a6540",outline=ink,width=2,tags=tag)
+            self.canvas.create_line(x-w/2,y-h/2,x+w/2,y-h/2,fill=ink,width=2,tags=tag)
+        elif s=="bed":
+            self.canvas.create_rectangle(x-w/2,y-h/2,x+w/2,y+h/2,fill="#9b745d",outline=ink,width=2,tags=tag)
+            self.canvas.create_rectangle(x-w*.42,y-h*.4,x+w*.42,y-h*.08,fill="#d8cfb9",outline="",tags=tag)
+        elif s in {"chest","crate","cabinet","wardrobe"}:
+            fill="#6f4d31" if s!="crate" else "#87623d"
+            self.canvas.create_rectangle(x-w/2,y-h/2,x+w/2,y+h/2,fill=fill,outline=ink,width=2,tags=tag)
+            self.canvas.create_line(x-w/2,y,x+w/2,y,fill="#b28a58",tags=tag)
+        elif s in {"shelf","bookshelf","weapon_rack"}:
+            self.canvas.create_rectangle(x-w/2,y-h/2,x+w/2,y+h/2,fill="#5f4732",outline=ink,width=2,tags=tag)
+            for yy in (-.25,0,.25): self.canvas.create_line(x-w*.42,y+h*yy,x+w*.42,y+h*yy,fill="#c29b68",tags=tag)
+        elif s in {"barrel"}:
+            self.canvas.create_oval(x-w/2,y-h/2,x+w/2,y+h/2,fill="#745238",outline=ink,width=2,tags=tag)
+            self.canvas.create_line(x-w*.4,y,x+w*.4,y,fill=metal,width=2,tags=tag)
+        elif s in {"lamp","campfire","fireplace"}:
+            self.canvas.create_oval(x-w*.32,y-h*.32,x+w*.32,y+h*.32,fill="#f3b64c",outline="#6d4528",width=2,tags=tag)
+        elif s in {"rug"}:
+            self.canvas.create_oval(x-w/2,y-h/2,x+w/2,y+h/2,fill="#775477",outline="#d2a56c",width=2,tags=tag)
+        elif s in {"plant"}:
+            self.canvas.create_oval(x-w*.35,y-h*.45,x+w*.35,y+h*.2,fill="#4f7b45",outline="#294f2d",tags=tag)
+            self.canvas.create_rectangle(x-w*.2,y+h*.1,x+w*.2,y+h*.45,fill="#8a6546",outline=ink,tags=tag)
+        elif s in {"anvil","forge"}:
+            self.canvas.create_polygon(x-w/2,y, x-w*.1,y-h*.35, x+w*.5,y-h*.15, x+w*.35,y+h*.35, x-w*.35,y+h*.35, fill="#686b6b",outline=ink,tags=tag)
+        elif s in {"altar","statue"}:
+            self.canvas.create_rectangle(x-w*.38,y-h*.22,x+w*.38,y+h*.42,fill="#9a978d",outline=ink,width=2,tags=tag)
+            if s=="statue": self.canvas.create_oval(x-w*.18,y-h*.48,x+w*.18,y-h*.15,fill="#aaa79d",outline=ink,tags=tag)
+        elif s in {"road_sign","sign"}:
+            self.canvas.create_line(x,y-h*.45,x,y+h*.45,fill="#62462f",width=max(2,int(3*self.zoom)),tags=tag)
+            self.canvas.create_polygon(x-w*.45,y-h*.3,x+w*.25,y-h*.3,x+w*.45,y-h*.05,x+w*.25,y+h*.18,x-w*.45,y+h*.18,fill="#9a7043",outline=ink,tags=tag)
+        elif s=="market_stall":
+            self.canvas.create_rectangle(x-w*.45,y-h*.18,x+w*.45,y+h*.42,fill="#8a6540",outline=ink,width=2,tags=tag)
+            self.canvas.create_polygon(x-w*.55,y-h*.42,x+w*.55,y-h*.42,x+w*.42,y-h*.08,x-w*.42,y-h*.08,fill="#9f5d55",outline=ink,tags=tag)
+        elif s=="well":
+            self.canvas.create_oval(x-w*.45,y-h*.3,x+w*.45,y+h*.35,fill="#8f8b7e",outline=ink,width=2,tags=tag)
+            self.canvas.create_oval(x-w*.28,y-h*.17,x+w*.28,y+h*.22,fill="#355f78",outline="#4a443b",width=2,tags=tag)
+        elif s=="fence":
+            self.canvas.create_line(x-w*.48,y,x+w*.48,y,fill="#765436",width=max(3,int(5*self.zoom)),tags=tag)
+            for ox in (-.4,-.15,.15,.4): self.canvas.create_line(x+w*ox,y-h*.4,x+w*ox,y+h*.4,fill="#765436",width=max(2,int(3*self.zoom)),tags=tag)
+        elif s=="cart":
+            self.canvas.create_rectangle(x-w*.38,y-h*.28,x+w*.3,y+h*.25,fill="#89603a",outline=ink,width=2,tags=tag)
+            self.canvas.create_oval(x-w*.42,y+h*.1,x-w*.18,y+h*.42,fill="#5b4938",outline=ink,width=2,tags=tag)
+            self.canvas.create_oval(x+w*.08,y+h*.1,x+w*.32,y+h*.42,fill="#5b4938",outline=ink,width=2,tags=tag)
+            self.canvas.create_line(x+w*.3,y,x+w*.55,y-h*.15,fill="#6f4d31",width=2,tags=tag)
+        elif s=="boat":
+            self.canvas.create_polygon(x-w*.48,y,x-w*.32,y-h*.28,x+w*.36,y-h*.28,x+w*.48,y,x+w*.3,y+h*.28,x-w*.32,y+h*.28,fill="#865d39",outline=ink,tags=tag)
+        elif s in {"treasure","loot"}:
+            self.canvas.create_oval(x-w*.45,y-h*.25,x+w*.45,y+h*.3,fill="#d1a53c",outline="#6b5128",width=2,tags=tag)
+        elif s=="bones":
+            self.canvas.create_line(x-w*.4,y-h*.25,x+w*.4,y+h*.25,fill="#d8d0b9",width=3,tags=tag)
+            self.canvas.create_line(x-w*.4,y+h*.25,x+w*.4,y-h*.25,fill="#d8d0b9",width=3,tags=tag)
+        elif s in {"chess","chess_board"}:
+            self.canvas.create_rectangle(x-w/2,y-h/2,x+w/2,y+h/2,fill="#d2b98a",outline=ink,width=2,tags=tag)
+            for iy in range(4):
+                for ix in range(4):
+                    if (ix+iy)%2: self.canvas.create_rectangle(x-w/2+ix*w/4,y-h/2+iy*h/4,x-w/2+(ix+1)*w/4,y-h/2+(iy+1)*h/4,fill="#5d4b3b",outline="",tags=tag)
+        else:
+            self.canvas.create_rectangle(x-w/2,y-h/2,x+w/2,y+h/2,fill=cloth,outline=ink,width=1,tags=tag)
+
+    def _draw_object_pil(self, d: ImageDraw.ImageDraw, e: Entity) -> None:
+        x,y=e.x,e.y; w=max(4,e.width); h=max(4,e.height); s=e.subtype.replace(" ","_")
+        if int(e.metadata.get("rotation",0)) % 180 == 90: w,h=h,w
+        box=(x-w/2,y-h/2,x+w/2,y+h/2); ink=(50,41,31,255); wood=(119,85,53,255)
+        if s in {"barrel"}: d.ellipse(box,fill=(116,82,56,255),outline=ink,width=2)
+        elif s in {"rug"}: d.ellipse(box,fill=(119,84,119,220),outline=(210,165,108,255),width=2)
+        elif s in {"lamp","campfire","fireplace"}: d.ellipse(box,fill=(243,182,76,230),outline=(109,69,40,255),width=2)
+        elif s in {"chair","bench","pew","table","desk","counter","workbench","bed","chest","crate","cabinet","wardrobe","shelf","bookshelf","weapon_rack"}: d.rectangle(box,fill=wood,outline=ink,width=2)
+        elif s in {"plant"}: d.ellipse(box,fill=(79,123,69,220),outline=(41,79,45,255),width=1)
+        else: d.rectangle(box,fill=(128,104,76,210),outline=ink,width=1)
 
     def _safe(self,value:str)->str:
         return "".join(c.lower() if c.isalnum() else "_" for c in value).strip("_")[:80]
